@@ -1,21 +1,29 @@
 use std::fs;
 use std::path::Path;
-use std::process::Command;
+
+use rcgen::{
+    CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, Issuer, KeyPair,
+    SanType, SigningKey,
+};
+
+use super::paths::ClnSourcePaths;
 
 /// Errors during certificate generation
 #[derive(Debug)]
 pub enum CertError {
     Io(std::io::Error),
-    Openssl(String),
+    Rcgen(rcgen::Error),
     MissingSource(String),
+    InvalidIp(String),
 }
 
 impl std::fmt::Display for CertError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CertError::Io(e) => write!(f, "IO error: {}", e),
-            CertError::Openssl(e) => write!(f, "OpenSSL error: {}", e),
+            CertError::Rcgen(e) => write!(f, "Certificate error: {}", e),
             CertError::MissingSource(e) => write!(f, "Missing source: {}", e),
+            CertError::InvalidIp(e) => write!(f, "Invalid IP address: {}", e),
         }
     }
 }
@@ -28,136 +36,101 @@ impl From<std::io::Error> for CertError {
     }
 }
 
-/// Run an openssl command and return error on failure
-fn openssl_run(args: &[&str]) -> Result<(), CertError> {
-    let output = Command::new("openssl")
-        .args(args)
-        .output()
-        .map_err(CertError::Io)?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(CertError::Openssl(stderr.to_string()));
+impl From<rcgen::Error> for CertError {
+    fn from(e: rcgen::Error) -> Self {
+        CertError::Rcgen(e)
     }
-    Ok(())
+}
+
+/// Read CA certificate and key from CLN source directory
+/// Returns the Issuer (for signing new certificates)
+pub fn read_cln_ca(source: &ClnSourcePaths) -> Result<Issuer<'static, KeyPair>, CertError> {
+    if !source.ca_file.exists() {
+        return Err(CertError::MissingSource(format!(
+            "CA certificate not found: {}",
+            source.ca_file.display()
+        )));
+    }
+    if !source.ca_key_file.exists() {
+        return Err(CertError::MissingSource(format!(
+            "CA key not found: {}",
+            source.ca_key_file.display()
+        )));
+    }
+
+    let ca_pem = fs::read_to_string(&source.ca_file)?;
+    let ca_key_pem = fs::read_to_string(&source.ca_key_file)?;
+
+    let ca_key = KeyPair::from_pem(&ca_key_pem).map_err(CertError::Rcgen)?;
+    let issuer = Issuer::from_ca_cert_pem(&ca_pem, ca_key).map_err(CertError::Rcgen)?;
+
+    Ok(issuer)
 }
 
 /// Generate a client certificate signed by the CA
-pub fn generate_client_cert(
-    ca_cert_path: &Path,
-    ca_key_path: &Path,
+pub fn generate_client_cert<S: SigningKey>(
+    issuer: &Issuer<'_, S>,
     hostname: &str,
     output_dir: &Path,
 ) -> Result<(), CertError> {
-    // Generate client key
-    openssl_run(&[
-        "genrsa",
-        "-out",
-        output_dir.join("client-key.pem").to_str().unwrap(),
-        "2048",
-    ])?;
+    let client_key = KeyPair::generate().map_err(CertError::Rcgen)?;
 
-    // Generate CSR
-    openssl_run(&[
-        "req",
-        "-new",
-        "-key",
-        output_dir.join("client-key.pem").to_str().unwrap(),
-        "-out",
-        "/tmp/gcob_client.csr",
-        "-subj",
-        &format!("/CN={}", hostname),
-    ])?;
+    let mut params =
+        CertificateParams::new(vec![hostname.to_string()]).map_err(CertError::Rcgen)?;
+    params.distinguished_name = DistinguishedName::new();
+    params.distinguished_name.push(DnType::CommonName, hostname);
+    params
+        .extended_key_usages
+        .push(ExtendedKeyUsagePurpose::ClientAuth);
 
-    // Sign with CA (clientAuth)
-    // Create temp ext file
-    fs::write("/tmp/gcob_client_ext.cnf", "extendedKeyUsage=clientAuth\n")?;
-    openssl_run(&[
-        "x509",
-        "-req",
-        "-in",
-        "/tmp/gcob_client.csr",
-        "-CA",
-        ca_cert_path.to_str().unwrap(),
-        "-CAkey",
-        ca_key_path.to_str().unwrap(),
-        "-CAcreateserial",
-        "-out",
-        output_dir.join("client.pem").to_str().unwrap(),
-        "-days",
-        "3650",
-        "-extfile",
-        "/tmp/gcob_client_ext.cnf",
-    ])?;
+    let cert = params
+        .signed_by(&client_key, issuer)
+        .map_err(CertError::Rcgen)?;
 
-    // Clean up
-    let _ = fs::remove_file("/tmp/gcob_client.csr");
-    let _ = fs::remove_file("/tmp/gcob_client_ext.cnf");
+    // Write client certificate
+    fs::write(output_dir.join("client.pem"), cert.pem())?;
+
+    // Write client key
+    fs::write(
+        output_dir.join("client-key.pem"),
+        client_key.serialize_pem(),
+    )?;
 
     Ok(())
 }
 
 /// Generate a server certificate signed by the CA with SAN extensions
-pub fn generate_server_cert(
-    ca_cert_path: &Path,
-    ca_key_path: &Path,
+pub fn generate_server_cert<S: SigningKey>(
+    issuer: &Issuer<'_, S>,
     hostname: &str,
     ip: &str,
     output_dir: &Path,
 ) -> Result<(), CertError> {
-    // Create SAN config
-    let san_config = format!(
-        "[req]\ndistinguished_name = req_dn\nreq_extensions = v3_ca\n\n[req_dn]\n\n[v3_ca]\nsubjectAltName = DNS:{},DNS:localhost,IP:{}\n",
-        hostname, ip
-    );
-    fs::write("/tmp/gcob_san.cnf", &san_config)?;
+    let server_key = KeyPair::generate().map_err(CertError::Rcgen)?;
 
-    // Generate server key
-    openssl_run(&[
-        "genrsa",
-        "-out",
-        output_dir.join("server-key.pem").to_str().unwrap(),
-        "4096",
-    ])?;
+    let ip_addr: std::net::IpAddr = ip
+        .parse()
+        .map_err(|_| CertError::InvalidIp(ip.to_string()))?;
 
-    // Generate CSR with SAN
-    openssl_run(&[
-        "req",
-        "-new",
-        "-key",
-        output_dir.join("server-key.pem").to_str().unwrap(),
-        "-out",
-        "/tmp/gcob_server.csr",
-        "-subj",
-        &format!("/CN={}", hostname),
-        "-config",
-        "/tmp/gcob_san.cnf",
-    ])?;
+    let san_names = vec![hostname.to_string(), "localhost".to_string()];
 
-    // Sign with CA and extensions
-    openssl_run(&[
-        "x509",
-        "-req",
-        "-in",
-        "/tmp/gcob_server.csr",
-        "-CA",
-        ca_cert_path.to_str().unwrap(),
-        "-CAkey",
-        ca_key_path.to_str().unwrap(),
-        "-CAcreateserial",
-        "-out",
-        output_dir.join("server.pem").to_str().unwrap(),
-        "-days",
-        "3650",
-        "-extfile",
-        "/tmp/gcob_san.cnf",
-        "-extensions",
-        "v3_ca",
-    ])?;
+    let mut params = CertificateParams::new(san_names).map_err(CertError::Rcgen)?;
+    params.distinguished_name = DistinguishedName::new();
+    params.distinguished_name.push(DnType::CommonName, hostname);
+    params.subject_alt_names.push(SanType::IpAddress(ip_addr));
 
-    // Clean up
-    let _ = fs::remove_file("/tmp/gcob_server.csr");
-    let _ = fs::remove_file("/tmp/gcob_san.cnf");
+    let cert = params
+        .signed_by(&server_key, issuer)
+        .map_err(CertError::Rcgen)?;
+
+    // Write server certificate
+    fs::write(output_dir.join("server.pem"), cert.pem())?;
+
+    // Write server key
+    fs::write(
+        output_dir.join("server-key.pem"),
+        server_key.serialize_pem(),
+    )?;
 
     Ok(())
 }

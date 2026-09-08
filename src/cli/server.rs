@@ -20,38 +20,22 @@ pub fn handle_init_client() -> Result<(), CertError> {
     println!("  Output: {}", client_paths.cert_dir.display());
     println!();
 
-    // Verify CLN source
-    println!("[1/4] Verifying CLN source certificates...");
-    if !cln_source.ca_file.exists() {
-        return Err(CertError::MissingSource(format!(
-            "CA certificate not found: {}",
-            cln_source.ca_file.display()
-        )));
-    }
-    if !cln_source.ca_key_file.exists() {
-        return Err(CertError::MissingSource(format!(
-            "CA key not found: {}",
-            cln_source.ca_key_file.display()
-        )));
-    }
-    println!("  [✓] CA certificates found");
+    // Step 1: Read CA from CLN source
+    println!("[1/4] Reading CA from CLN source...");
+    let issuer = generate::read_cln_ca(&cln_source)?;
+    println!("  [✓] CA loaded");
 
-    // Create output directory
+    // Step 2: Create output directory
     println!("[2/4] Creating certificate directory...");
     fs::create_dir_all(&client_paths.cert_dir)?;
     println!("  [✓] {}", client_paths.cert_dir.display());
 
-    // Generate client certificate
+    // Step 3: Generate client certificate
     println!("[3/4] Generating client certificate...");
-    generate::generate_client_cert(
-        &cln_source.ca_file,
-        &cln_source.ca_key_file,
-        &hostname,
-        &client_paths.cert_dir,
-    )?;
+    generate::generate_client_cert(&issuer, &hostname, &client_paths.cert_dir)?;
     println!("  [✓] client.pem generated with clientAuth");
 
-    // Set permissions
+    // Step 4: Set permissions
     println!("[4/4] Setting permissions...");
     #[cfg(unix)]
     {
@@ -92,60 +76,38 @@ pub fn handle_init_server() -> Result<(), CertError> {
     println!("  HAProxy CA: {}", server_paths.haproxy_ca_dir.display());
     println!();
 
-    // Verify CLN source
-    println!("[1/6] Verifying CLN source certificates...");
-    if !cln_source.ca_file.exists() {
-        return Err(CertError::MissingSource(format!(
-            "CA certificate not found: {}",
-            cln_source.ca_file.display()
-        )));
-    }
-    if !cln_source.ca_key_file.exists() {
-        return Err(CertError::MissingSource(format!(
-            "CA key not found: {}",
-            cln_source.ca_key_file.display()
-        )));
-    }
-    println!("  [✓] CA certificates found");
+    // Step 1: Read CA from CLN source
+    println!("[1/6] Reading CA from CLN source...");
+    let issuer = generate::read_cln_ca(&cln_source)?;
+    println!("  [✓] CA loaded");
 
-    // Create HAProxy directories
+    // Step 2: Create HAProxy directories
     println!("[2/6] Creating directories...");
     fs::create_dir_all(&server_paths.haproxy_cert_dir)?;
     fs::create_dir_all(&server_paths.haproxy_ca_dir)?;
     println!("  [✓] {}", server_paths.haproxy_cert_dir.display());
     println!("  [✓] {}", server_paths.haproxy_ca_dir.display());
 
-    // Copy CA to HAProxy ca-certs
+    // Step 3: Copy CA to HAProxy ca-certs
     println!("[3/6] Copying CA to HAProxy ca-certs...");
     generate::copy_file(&cln_source.ca_file, &server_paths.ca_file)?;
     generate::copy_file(&cln_source.ca_key_file, &server_paths.ca_key_file)?;
     println!("  [✓] ca.pem copied");
     println!("  [✓] ca-key.pem copied");
 
-    // Generate server certificate
+    // Step 4: Generate server certificate
     println!("[4/6] Generating server certificate...");
     let temp_dir = Path::new("/tmp/gcob_certs");
     fs::create_dir_all(temp_dir)?;
-    generate::generate_server_cert(
-        &cln_source.ca_file,
-        &cln_source.ca_key_file,
-        &hostname,
-        &ip,
-        temp_dir,
-    )?;
+    generate::generate_server_cert(&issuer, &hostname, &ip, temp_dir)?;
     println!("  [✓] server.pem generated with SAN");
 
-    // Generate client certificate for HAProxy
+    // Step 5: Generate client certificate for HAProxy
     println!("[5/6] Generating client certificate for HAProxy...");
-    generate::generate_client_cert(
-        &cln_source.ca_file,
-        &cln_source.ca_key_file,
-        &hostname,
-        temp_dir,
-    )?;
+    generate::generate_client_cert(&issuer, &hostname, temp_dir)?;
     println!("  [✓] client.pem generated with clientAuth");
 
-    // Concatenate and copy to HAProxy
+    // Step 6: Concatenate and copy to HAProxy
     println!("[6/6] Creating HAProxy bundles...");
     generate::concat_cert_key(
         &temp_dir.join("server.pem"),
