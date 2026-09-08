@@ -1,0 +1,126 @@
+syntax = "proto3";
+
+package cln;
+
+// --- Payment Events ---
+
+message PaymentSucceeded {
+  string event_id = 1;
+  int64 timestamp = 2;
+  string payment_hash = 3;
+  uint64 amount_msat = 4;
+  uint64 amount_sent_msat = 5;
+  string node_id = 6;
+  string recommendation = 7;
+}
+
+message PaymentFailed {
+  string event_id = 1;
+  int64 timestamp = 2;
+  string payment_hash = 3;
+  string failure_reason = 4;
+  uint64 amount_msat = 5;
+  string recommendation = 6;
+}
+
+// --- Invoice Events ---
+
+message InvoiceCreated {
+  string event_id = 1;
+  int64 timestamp = 2;
+  string label = 3;
+  optional uint64 amount_msat = 4;
+  string description = 5;
+  string bolt11 = 6;
+  string recommendation = 7;
+}
+
+message InvoicePaid {
+  string event_id = 1;
+  int64 timestamp = 2;
+  string label = 3;
+  uint64 amount_msat = 4;
+  string payment_hash = 5;
+  string recommendation = 6;
+}
+
+// --- Channel Events ---
+
+message ChannelOpened {
+  string event_id = 1;
+  int64 timestamp = 2;
+  string node_id = 3;
+  string channel_id = 4;
+  uint64 amount_msat = 5;
+  string recommendation = 6;
+}
+
+message ChannelOpenFailed {
+  string event_id = 1;
+  int64 timestamp = 2;
+  string node_id = 3;
+  string reason = 4;
+  string recommendation = 5;
+}
+
+message ChannelStateChanged {
+  string event_id = 1;
+  int64 timestamp = 2;
+  string channel_id = 3;
+  string old_state = 4;
+  string new_state = 5;
+  string recommendation = 6;
+}
+
+// --- Peer Events ---
+
+message PeerConnected {
+  string event_id = 1;
+  int64 timestamp = 2;
+  string node_id = 3;
+  string addr = 4;
+  string direction = 5;
+  string recommendation = 6;
+}
+
+message PeerDisconnected {
+  string event_id = 1;
+  int64 timestamp = 2;
+  string node_id = 3;
+  string recommendation = 4;
+}
+
+// --- System Events ---
+
+message SystemWarning {
+  string event_id = 1;
+  int64 timestamp = 2;
+  string source = 3;
+  string log = 4;
+  string recommendation = 5;
+}
+
+message SystemBlockAdded {
+  string event_id = 1;
+  int64 timestamp = 2;
+  uint64 block_height = 3;
+  string recommendation = 4;
+}
+
+// --- Unified Event Wrapper ---
+
+message Event {
+  oneof event {
+    PaymentSucceeded payment_succeeded = 1;
+    PaymentFailed payment_failed = 2;
+    InvoiceCreated invoice_created = 3;
+    InvoicePaid invoice_paid = 4;
+    ChannelOpened channel_opened = 5;
+    ChannelOpenFailed channel_open_failed = 6;
+    ChannelStateChanged channel_state_changed = 7;
+    PeerConnected peer_connected = 8;
+    PeerDisconnected peer_disconnected = 9;
+    SystemWarning system_warning = 10;
+    SystemBlockAdded system_block_added = 11;
+  }
+}

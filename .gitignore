@@ -1,0 +1,29 @@
+# Build artifacts
+/target
+
+# Environment
+.env
+
+# Backups
+*.bak
+
+# Development directories
+genesis_green/
+.opencode/
+opencode/
+ctx_csf/
+ctx_genesis/
+
+# Certs (generated locally)
+*.pem
+*.key
+*.crt
+*.p12
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
