@@ -47,16 +47,14 @@ pub fn to_proto_event(event: &types::Event) -> Option<cln_api::Event> {
                     "converted InvoicePaid"
                 );
                 Some(cln_api::Event {
-                    event: Some(cln_api::event::Event::InvoicePaid(
-                        cln_api::InvoicePaid {
-                            event_id: event_id.clone(),
-                            timestamp: *timestamp,
-                            label: label.clone(),
-                            amount_msat: *amount_msat,
-                            payment_hash: payment_hash.clone(),
-                            recommendation: format!("{}. {}", rec.summary, rec.action),
-                        },
-                    )),
+                    event: Some(cln_api::event::Event::InvoicePaid(cln_api::InvoicePaid {
+                        event_id: event_id.clone(),
+                        timestamp: *timestamp,
+                        label: label.clone(),
+                        amount_msat: *amount_msat,
+                        payment_hash: payment_hash.clone(),
+                        recommendation: format!("{}. {}", rec.summary, rec.action),
+                    })),
                 })
             }
         },

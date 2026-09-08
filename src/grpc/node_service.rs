@@ -37,14 +37,12 @@ impl NodeServices for ApiService {
         tracing::info!("Rune validated - allowing invoice request through");
 
         let client_id = extract_client_id(&request).ok_or_else(|| {
-            Status::invalid_argument(format!(
-                "Missing or invalid '{}' header",
-                CLIENT_ID_HEADER
-            ))
+            Status::invalid_argument(format!("Missing or invalid '{}' header", CLIENT_ID_HEADER))
         })?;
 
         let allowed = match &self.redis_cm {
-            Some(cm) => check_rate_limit(cm, &client_id).await
+            Some(cm) => check_rate_limit(cm, &client_id)
+                .await
                 .map_err(|_| Status::unavailable("Rate limiter unavailable"))?,
             None => {
                 tracing::warn!("Valkey not connected - rate limiting skipped");
@@ -105,7 +103,8 @@ impl NodeServices for ApiService {
         &self,
         _request: Request<()>,
     ) -> Result<Response<Self::XpayStreamStream>, Status> {
-        let (internal_tx, mut internal_rx) = tokio::sync::mpsc::channel::<crate::events::types::Event>(64);
+        let (internal_tx, mut internal_rx) =
+            tokio::sync::mpsc::channel::<crate::events::types::Event>(64);
         let (proto_tx, proto_rx) = tokio::sync::mpsc::channel::<Result<cln_api::Event, Status>>(64);
 
         let router = self.event_router.clone();
@@ -121,7 +120,9 @@ impl NodeServices for ApiService {
             tracing::info!(subscriber_id = %sub_id, "xpay_stream subscribed");
             while let Some(event) = internal_rx.recv().await {
                 tracing::debug!(subscriber_id = %sub_id, "payment event received");
-                if let Some(proto_event) = crate::domain::invoice::pay_stream::to_proto_event(&event) {
+                if let Some(proto_event) =
+                    crate::domain::invoice::pay_stream::to_proto_event(&event)
+                {
                     if proto_tx.send(Ok(proto_event)).await.is_err() {
                         tracing::warn!(subscriber_id = %sub_id, "xpay_stream client disconnected");
                         break;
@@ -141,7 +142,8 @@ impl NodeServices for ApiService {
         &self,
         _request: Request<()>,
     ) -> Result<Response<Self::InvoiceWatchStream>, Status> {
-        let (internal_tx, mut internal_rx) = tokio::sync::mpsc::channel::<crate::events::types::Event>(64);
+        let (internal_tx, mut internal_rx) =
+            tokio::sync::mpsc::channel::<crate::events::types::Event>(64);
         let (proto_tx, proto_rx) = tokio::sync::mpsc::channel::<Result<cln_api::Event, Status>>(64);
 
         let router = self.event_router.clone();
@@ -177,7 +179,8 @@ impl NodeServices for ApiService {
         &self,
         _request: Request<()>,
     ) -> Result<Response<Self::WatchChannelsStream>, Status> {
-        let (internal_tx, mut internal_rx) = tokio::sync::mpsc::channel::<crate::events::types::Event>(64);
+        let (internal_tx, mut internal_rx) =
+            tokio::sync::mpsc::channel::<crate::events::types::Event>(64);
         let (proto_tx, proto_rx) = tokio::sync::mpsc::channel::<Result<cln_api::Event, Status>>(64);
 
         let router = self.event_router.clone();
@@ -213,7 +216,8 @@ impl NodeServices for ApiService {
         &self,
         _request: Request<()>,
     ) -> Result<Response<Self::WatchPeersStream>, Status> {
-        let (internal_tx, mut internal_rx) = tokio::sync::mpsc::channel::<crate::events::types::Event>(64);
+        let (internal_tx, mut internal_rx) =
+            tokio::sync::mpsc::channel::<crate::events::types::Event>(64);
         let (proto_tx, proto_rx) = tokio::sync::mpsc::channel::<Result<cln_api::Event, Status>>(64);
 
         let router = self.event_router.clone();
@@ -249,7 +253,8 @@ impl NodeServices for ApiService {
         &self,
         _request: Request<()>,
     ) -> Result<Response<Self::WatchSystemStream>, Status> {
-        let (internal_tx, mut internal_rx) = tokio::sync::mpsc::channel::<crate::events::types::Event>(64);
+        let (internal_tx, mut internal_rx) =
+            tokio::sync::mpsc::channel::<crate::events::types::Event>(64);
         let (proto_tx, proto_rx) = tokio::sync::mpsc::channel::<Result<cln_api::Event, Status>>(64);
 
         let router = self.event_router.clone();
@@ -265,7 +270,9 @@ impl NodeServices for ApiService {
             tracing::info!(subscriber_id = %sub_id, "watch_system subscribed");
             while let Some(event) = internal_rx.recv().await {
                 tracing::debug!(subscriber_id = %sub_id, "system event received");
-                if let Some(proto_event) = crate::domain::info::system_events::to_proto_event(&event) {
+                if let Some(proto_event) =
+                    crate::domain::info::system_events::to_proto_event(&event)
+                {
                     if proto_tx.send(Ok(proto_event)).await.is_err() {
                         tracing::warn!(subscriber_id = %sub_id, "watch_system client disconnected");
                         break;

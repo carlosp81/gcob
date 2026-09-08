@@ -87,8 +87,8 @@ impl Default for EventRouter {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::types::*;
+    use super::*;
 
     #[tokio::test]
     async fn subscribe_and_count() {
@@ -149,7 +149,10 @@ mod tests {
         router.dispatch("invoice", event).await;
 
         let result = rx.try_recv();
-        assert!(result.is_err(), "should not receive invoice event on payment subscriber");
+        assert!(
+            result.is_err(),
+            "should not receive invoice event on payment subscriber"
+        );
     }
 
     #[tokio::test]
@@ -170,8 +173,14 @@ mod tests {
 
         router.dispatch("payment", event).await;
 
-        assert_eq!(rx1.recv().await.expect("sub-1 should receive").event_id(), "evt-3");
-        assert_eq!(rx2.recv().await.expect("sub-2 should receive").event_id(), "evt-3");
+        assert_eq!(
+            rx1.recv().await.expect("sub-1 should receive").event_id(),
+            "evt-3"
+        );
+        assert_eq!(
+            rx2.recv().await.expect("sub-2 should receive").event_id(),
+            "evt-3"
+        );
     }
 
     #[tokio::test]

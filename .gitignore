@@ -20,6 +20,12 @@ ctx_genesis/
 *.crt
 *.p12
 
+# Scripts (replaced by CLI)
+setup_certs.sh
+
+# Plans
+cli_plan.md
+
 # IDE
 .vscode/
 .idea/

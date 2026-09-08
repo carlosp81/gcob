@@ -20,9 +20,7 @@ pub fn payment_recommendation(event: &PaymentEvent) -> Recommendation {
                 action: "No action required.".into(),
             }
         }
-        PaymentEvent::Failed {
-            failure_reason, ..
-        } => match failure_reason.as_str() {
+        PaymentEvent::Failed { failure_reason, .. } => match failure_reason.as_str() {
             "timeout" => Recommendation {
                 summary: "Payment timed out.".into(),
                 action: "Check network connectivity and CLN peers.".into(),
@@ -44,15 +42,11 @@ pub fn payment_recommendation(event: &PaymentEvent) -> Recommendation {
                 action: "Check CLN logs for detailed error information.".into(),
             },
         },
-        PaymentEvent::PartEnd {
-            amount_msat, ..
-        } => Recommendation {
+        PaymentEvent::PartEnd { amount_msat, .. } => Recommendation {
             summary: format!("Payment part completed: {} msat", amount_msat),
             action: "Multi-part payment in progress.".into(),
         },
-        PaymentEvent::PartStart {
-            amount_msat, ..
-        } => Recommendation {
+        PaymentEvent::PartStart { amount_msat, .. } => Recommendation {
             summary: format!("Payment part starting: {} msat", amount_msat),
             action: "Multi-part payment initiated.".into(),
         },
@@ -62,9 +56,7 @@ pub fn payment_recommendation(event: &PaymentEvent) -> Recommendation {
 pub fn invoice_recommendation(event: &InvoiceEvent) -> Recommendation {
     match event {
         InvoiceEvent::Created {
-            label,
-            amount_msat,
-            ..
+            label, amount_msat, ..
         } => {
             let amount_str = match amount_msat {
                 Some(a) => format!("{} msat", a),
@@ -76,9 +68,7 @@ pub fn invoice_recommendation(event: &InvoiceEvent) -> Recommendation {
             }
         }
         InvoiceEvent::Paid {
-            label,
-            amount_msat,
-            ..
+            label, amount_msat, ..
         } => Recommendation {
             summary: format!("Invoice '{}' paid: {} msat", label, amount_msat),
             action: "Funds received. Fulfill order if applicable.".into(),
@@ -129,11 +119,7 @@ pub fn channel_recommendation(event: &ChannelEvent) -> Recommendation {
 
 pub fn peer_recommendation(event: &PeerEvent) -> Recommendation {
     match event {
-        PeerEvent::Connected {
-            node_id,
-            addr,
-            ..
-        } => Recommendation {
+        PeerEvent::Connected { node_id, addr, .. } => Recommendation {
             summary: format!("Peer {} connected at {}", node_id, addr),
             action: "Peer is available for payments.".into(),
         },
@@ -142,9 +128,7 @@ pub fn peer_recommendation(event: &PeerEvent) -> Recommendation {
             action: "Check peer connectivity and network status.".into(),
         },
         PeerEvent::CustomMsg {
-            node_id,
-            msgtype,
-            ..
+            node_id, msgtype, ..
         } => Recommendation {
             summary: format!("Custom message type {} from peer {}", msgtype, node_id),
             action: "Custom protocol message received.".into(),
@@ -154,9 +138,7 @@ pub fn peer_recommendation(event: &PeerEvent) -> Recommendation {
 
 pub fn system_recommendation(event: &SystemEvent) -> Recommendation {
     match event {
-        SystemEvent::BlockAdded {
-            block_height, ..
-        } => Recommendation {
+        SystemEvent::BlockAdded { block_height, .. } => Recommendation {
             summary: format!("New block: {}", block_height),
             action: "Blockchain synced.".into(),
         },
@@ -172,9 +154,7 @@ pub fn system_recommendation(event: &SystemEvent) -> Recommendation {
             summary: format!("Warning from {}: {}", source, log),
             action: "Review system health and CLN logs.".into(),
         },
-        SystemEvent::Log {
-            level, message, ..
-        } => Recommendation {
+        SystemEvent::Log { level, message, .. } => Recommendation {
             summary: format!("[{}] {}", level, message),
             action: "Log entry recorded.".into(),
         },

@@ -2,8 +2,8 @@
 
 pub mod channel;
 pub mod invoice;
-pub mod peer;
 pub mod payment;
+pub mod peer;
 pub mod system;
 
 use std::sync::Arc;
