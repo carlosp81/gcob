@@ -1,0 +1,29 @@
+syntax = "proto3";
+
+package cln;
+
+import "cln/node.proto";
+import "cln/events.proto";
+import "google/protobuf/empty.proto";
+
+service NodeServices {
+    // Crear una factura nueva
+    rpc Invoice(cln.InvoiceRequest) returns (cln.InvoiceResponse);
+    // Información del nodo
+    rpc Getinfo(cln.GetinfoRequest) returns (cln.GetinfoResponse);
+    // Pago via BOLT11/BOLT12
+    rpc Xpay(cln.XpayRequest) returns (cln.XpayResponse);
+
+    // --- Streaming RPCs ---
+
+    // Stream de eventos de pago (succeeded, failed, part_start, part_end)
+    rpc XpayStream(google.protobuf.Empty) returns (stream Event);
+    // Stream de eventos de factura (created, paid)
+    rpc InvoiceWatch(google.protobuf.Empty) returns (stream Event);
+    // Stream de eventos de canal (opened, open_failed, state_changed)
+    rpc WatchChannels(google.protobuf.Empty) returns (stream Event);
+    // Stream de eventos de peer (connected, disconnected)
+    rpc WatchPeers(google.protobuf.Empty) returns (stream Event);
+    // Stream de eventos del sistema (warning, block_added)
+    rpc WatchSystem(google.protobuf.Empty) returns (stream Event);
+}
