@@ -17,8 +17,9 @@ pub struct ApiService {
 }
 
 pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let cert_config = ClnConfig::from_env().unwrap();
-    let client = ClnClient::connect(&cert_config).await.unwrap();
+    let cert_config = ClnConfig::from_env()?;
+    cert_config.validate_all()?;
+    let client = ClnClient::connect(&cert_config).await?;
     let addr = cert_config.grpc_bind_addr.parse()?;
 
     let redis_url =

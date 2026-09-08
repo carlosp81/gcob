@@ -2,7 +2,6 @@ use std::env;
 use std::path::{Path, PathBuf};
 
 use tonic::Status;
-use tracing::warn;
 
 #[derive(Debug, Clone)]
 pub struct ClnConfig {
@@ -23,13 +22,13 @@ impl ClnConfig {
 
         let cert_dir = env::var("CLN_CERT_DIR")
             .map(PathBuf::from)
-            .expect("CLN_CERT_DIR must be set");
+            .map_err(|_| Status::failed_precondition("CLN_CERT_DIR must be set"))?;
 
         if !cert_dir.is_absolute() {
-            warn!(
-                "CLN_CERT_DIR is not absolute: {:#?}. Using as-is.",
+            return Err(Status::failed_precondition(format!(
+                "CLN_CERT_DIR is not absolute: {:?}",
                 cert_dir
-            );
+            )));
         }
 
         let ca_name = env::var("CLN_CA_FILE").unwrap_or_else(|_| "ca.pem".into());
@@ -47,25 +46,6 @@ impl ClnConfig {
         let server_file = cert_dir.join(&server_name);
         let server_key_file = cert_dir.join(&server_key_name);
 
-        if let Err(warning) = Self::validate_cert_dir(&cert_dir) {
-            warn!("{}", warning);
-        }
-        if let Err(warning) = Self::validate_cert(&ca_file, false) {
-            warn!("{}", warning);
-        }
-        if let Err(warning) = Self::validate_cert(&client_file, false) {
-            warn!("{}", warning);
-        }
-        if let Err(warning) = Self::validate_cert(&client_key_file, true) {
-            warn!("{}", warning);
-        }
-        if let Err(warning) = Self::validate_cert(&server_file, false) {
-            warn!("{}", warning);
-        }
-        if let Err(warning) = Self::validate_cert(&server_key_file, true) {
-            warn!("{}", warning);
-        }
-
         Ok(Self {
             cert_dir,
             ca_file,
@@ -73,63 +53,105 @@ impl ClnConfig {
             client_key_file,
             server_file,
             server_key_file,
-            node_uri: env::var("CLN_NODE_URI").expect("CLN_NODE_URI must be set"),
-            grpc_bind_addr: env::var("GRPC_BIND_ADDR").expect("GRPC_BIND_ADDR must be set"),
+            node_uri: env::var("CLN_NODE_URI")
+                .map_err(|_| Status::failed_precondition("CLN_NODE_URI must be set"))?,
+            grpc_bind_addr: env::var("GRPC_BIND_ADDR")
+                .map_err(|_| Status::failed_precondition("GRPC_BIND_ADDR must be set"))?,
         })
     }
 
-    fn validate_cert_dir(path: &Path) -> Result<(), String> {
-        if !path.exists() {
-            return Err(format!(
-                "Certificate directory does not exist: {}",
-                path.display()
-            ));
-        }
-        if !path.is_dir() {
-            return Err(format!(
-                "Certificate path is not a directory: {}",
-                path.display()
-            ));
-        }
+    pub fn validate_all(&self) -> Result<(), Status> {
+        Self::validate_cert_dir(&self.cert_dir)?;
+        Self::validate_cert(&self.ca_file, false)?;
+        Self::validate_cert(&self.client_file, false)?;
+        Self::validate_cert(&self.client_key_file, true)?;
+        Self::validate_cert(&self.server_file, false)?;
+        Self::validate_cert(&self.server_key_file, true)?;
+        Ok(())
+    }
+
+    pub fn validate_user() -> Result<(), Status> {
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let metadata = std::fs::metadata(path)
-                .map_err(|e| format!("Error reading metadata of {}: {}", path.display(), e))?;
-            let mode = metadata.permissions().mode();
-            if mode & 0o077 != 0 {
-                return Err(format!(
-                    "Directory {} has permissions {} — should be 0700. Run: chmod 0700 {}",
-                    path.display(),
-                    mode & 0o777,
-                    path.display()
-                ));
+            let user = env::var("USER").unwrap_or_default();
+            if user != "gcob" {
+                return Err(Status::permission_denied(format!(
+                    "Only user 'gcob' can start the API. Current: '{}'",
+                    user
+                )));
             }
         }
         Ok(())
     }
 
-    fn validate_cert(path: &Path, is_private_key: bool) -> Result<(), String> {
+    fn validate_cert_dir(path: &Path) -> Result<(), Status> {
         if !path.exists() {
-            return Err(format!("Certificate not found: {}", path.display()));
+            return Err(Status::failed_precondition(format!(
+                "Certificate directory does not exist: {}",
+                path.display()
+            )));
+        }
+        if !path.is_dir() {
+            return Err(Status::failed_precondition(format!(
+                "Certificate path is not a directory: {}",
+                path.display()
+            )));
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let metadata = std::fs::metadata(path).map_err(|e| {
+                Status::internal(format!(
+                    "Error reading metadata of {}: {}",
+                    path.display(),
+                    e
+                ))
+            })?;
+            let mode = metadata.permissions().mode();
+            if mode & 0o077 != 0 {
+                return Err(Status::failed_precondition(format!(
+                    "Directory {} has permissions {:o} — should be 0700. Run: chmod 0700 {}",
+                    path.display(),
+                    mode & 0o777,
+                    path.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_cert(path: &Path, is_private_key: bool) -> Result<(), Status> {
+        if !path.exists() {
+            return Err(Status::failed_precondition(format!(
+                "Certificate not found: {}",
+                path.display()
+            )));
         }
         if !path.is_file() {
-            return Err(format!("Path is not a file: {}", path.display()));
+            return Err(Status::failed_precondition(format!(
+                "Path is not a file: {}",
+                path.display()
+            )));
         }
         if is_private_key {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let metadata = std::fs::metadata(path)
-                    .map_err(|e| format!("Error reading metadata of {}: {}", path.display(), e))?;
+                let metadata = std::fs::metadata(path).map_err(|e| {
+                    Status::internal(format!(
+                        "Error reading metadata of {}: {}",
+                        path.display(),
+                        e
+                    ))
+                })?;
                 let mode = metadata.permissions().mode();
                 if mode & 0o077 != 0 {
-                    return Err(format!(
-                        "Private key {} has permissions {} — should be 0400. Run: chmod 0400 {}",
+                    return Err(Status::failed_precondition(format!(
+                        "Private key {} has permissions {:o} — should be 0400. Run: chmod 0400 {}",
                         path.display(),
                         mode & 0o777,
                         path.display()
-                    ));
+                    )));
                 }
             }
         }

@@ -154,7 +154,24 @@ pub fn handle_init_server() -> Result<(), CertError> {
 
 /// Handle `gcob serve`
 pub async fn handle_serve() -> Result<(), Box<dyn std::error::Error>> {
-    tracing::info!("Starting gcob server");
+    let env = std::env::var("GCOB_ENV").unwrap_or_else(|_| "production".into());
+    let is_dev = env == "development";
+
+    if is_dev {
+        tracing::warn!("Running in DEVELOPMENT mode");
+        let config = crate::certs::mtls_certs::ClnConfig::from_env()?;
+        config.validate_all()?;
+        match crate::certs::mtls_certs::ClnConfig::validate_user() {
+            Ok(()) => {}
+            Err(e) => tracing::warn!("User validation skipped: {}", e.message()),
+        }
+    } else {
+        tracing::info!("Running in PRODUCTION mode");
+        let config = crate::certs::mtls_certs::ClnConfig::from_env()?;
+        config.validate_all()?;
+        crate::certs::mtls_certs::ClnConfig::validate_user()?;
+    }
+
     crate::grpc::server::run().await
 }
 
