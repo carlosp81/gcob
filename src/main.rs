@@ -12,6 +12,8 @@ use cli::{Cli, Commands};
 
 #[tokio::main]
 async fn main() {
+    dotenvy::dotenv().ok();
+
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_target(true)
