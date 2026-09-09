@@ -82,6 +82,13 @@ pub enum Commands {
 
 #[derive(Subcommand)]
 pub enum CertsCommand {
+    /// List certificate status
+    List {
+        /// Show server certificates (HAProxy + CLN)
+        #[arg(long, hide = true)]
+        server: bool,
+    },
+
     /// Show detailed certificate information
     Show {
         /// Path to certificate file
@@ -96,7 +103,7 @@ pub enum CertsCommand {
         hostname: Option<String>,
     },
 
-    /// Renew all certificates
+    /// Renew certificates
     Renew {
         /// Force renewal even if not expired
         #[arg(long)]

@@ -1,60 +1,177 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::certs::inspect;
 
-/// Handle `gcob certs` (no subcommand) — show status of all certificates
-pub fn handle_status(cert_dir: &Path) {
-    println!("=== Certificate Status ===");
-    println!("  Directory: {}\n", cert_dir.display());
+/// Verify current user is 'gcob'. In production, blocks execution.
+/// In development (GCOB_ENV=development), logs a warning and continues.
+fn check_gcob_user() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    {
+        let user = std::env::var("USER").unwrap_or_default();
+        if user != "gcob" {
+            let env = std::env::var("GCOB_ENV").unwrap_or_else(|_| "production".into());
+            if env == "development" {
+                tracing::warn!(
+                    "User validation skipped (development mode): current user is '{}'",
+                    user
+                );
+            } else {
+                return Err(format!(
+                    "Permission denied: only user 'gcob' can manage certificates. Current: '{}'",
+                    user
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
 
-    let files = ["ca.pem", "server.pem", "client.pem"];
-    let mut all_valid = true;
+/// Handle `gcob certs` (no subcommand) — show usage help
+pub fn handle_no_subcommand() {
+    println!("Manage mTLS certificates for Bakog API and HAProxy.\n");
+    println!("Usage:");
+    println!("  gcob certs list              List client certificate status");
+    println!("  gcob certs show --cert FILE  Show detailed certificate info");
+    println!("  gcob certs verify            Verify chain of trust and SANs");
+    println!("  gcob certs renew             Renew certificates");
+}
 
-    for name in &files {
-        let path = cert_dir.join(name);
+/// Handle `gcob certs list [--server]`
+pub fn handle_list(server: bool) {
+    if let Err(e) = check_gcob_user() {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
+
+    println!("Discovering certificates...\n");
+
+    if server && !crate::certs::paths::is_server_env() {
+        eprintln!("Error: Server certificates not available.");
+        eprintln!(
+            "The Core Lightning node must be running on this machine to list server certificates."
+        );
+        std::process::exit(1);
+    }
+
+    // Client Certificates — always shown
+    let client_dir = Path::new("/etc/gcob/certs");
+    print_cert_status(
+        "Client Certificates:",
+        client_dir,
+        &["ca.pem", "client.pem", "client-key.pem"],
+    );
+
+    // Server sections — only when --server AND is_server_env()
+    if server {
+        let haproxy_dir = Path::new("/etc/haproxy/certs");
+        print_cert_status(
+            "HAProxy Certificates:",
+            haproxy_dir,
+            &[
+                "ca-certs/ca.pem",
+                "ca-certs/ca-key.pem",
+                "cert_server_concat.pem",
+                "cert_client_concat.pem",
+            ],
+        );
+
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+        let cln_dir = PathBuf::from(format!("{}/.lightning/bitcoin", home));
+        print_cert_status(
+            "CLN Certificates:",
+            &cln_dir,
+            &["ca.pem", "ca-key.pem", "server-key.pem"],
+        );
+    }
+}
+
+/// Internal helper: print status of certificate files in a directory
+fn print_cert_status(label: &str, dir: &Path, files: &[&str]) {
+    if !dir.exists() {
+        println!("  {}", label);
+        println!("    (directory not found)\n");
+        return;
+    }
+    println!("  {}", label);
+    for name in files {
+        let path = dir.join(name);
         if !path.exists() {
-            println!("  {:<14} ✗ Not found", name);
-            all_valid = false;
+            println!("    {:<32} \u{2717} Not found", name);
             continue;
         }
-
+        // Private keys: just check existence and permissions
+        if name.ends_with("-key.pem") {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                match std::fs::metadata(&path) {
+                    Ok(meta) => {
+                        let mode = meta.permissions().mode() & 0o777;
+                        let perm_str = if mode == 0o400 {
+                            "\u{2713} Read-only (0400)"
+                        } else {
+                            // Build warning with actual octal
+                            let mut parts = Vec::new();
+                            if mode & 0o004 != 0 {
+                                parts.push("group-read");
+                            }
+                            if mode & 0o002 != 0 {
+                                parts.push("group-write");
+                            }
+                            if mode & 0o040 != 0 {
+                                parts.push("other-read");
+                            }
+                            if mode & 0o020 != 0 {
+                                parts.push("other-write");
+                            }
+                            if mode & 0o001 != 0 {
+                                parts.push("other-exec");
+                            }
+                            if parts.is_empty() {
+                                "\u{2713} Restricted"
+                            } else {
+                                "\u{2717} Insecure"
+                            }
+                        };
+                        println!("    {:<32} {}", name, perm_str);
+                    }
+                    Err(e) => {
+                        println!("    {:<32} \u{2717} {}", name, e);
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                println!("    {:<32} \u{2713} Present", name);
+            }
+            continue;
+        }
+        // Certificates: parse and show validity
         match inspect::parse_cert(&path) {
             Ok(info) => {
                 let status = if info.days_remaining > 0 {
-                    "✓ Valid"
+                    format!("\u{2713} Valid ({} days)", info.days_remaining)
                 } else {
-                    all_valid = false;
-                    "✗ Expired"
+                    format!("\u{2717} Expired ({} days ago)", -info.days_remaining)
                 };
-
-                let san_str = if info.sans.is_empty() {
-                    "N/A".to_string()
-                } else {
-                    info.sans.join(", ")
-                };
-
-                println!(
-                    "  {:<14} {}  expires {} ({} days) SAN: {}",
-                    name, status, info.not_after, info.days_remaining, san_str
-                );
+                println!("    {:<32} {}", name, status);
             }
             Err(e) => {
-                println!("  {:<14} ✗ Parse error: {}", name, e);
-                all_valid = false;
+                println!("    {:<32} \u{2717} Parse error: {}", name, e);
             }
         }
     }
-
     println!();
-    if all_valid {
-        println!("All certificates are valid. No renewal needed.");
-    } else {
-        println!("Some certificates need attention. Run `gcob certs renew` to regenerate.");
-    }
 }
 
 /// Handle `gcob certs show --cert <FILE>`
 pub fn handle_show(cert_path: &Path) {
+    if let Err(e) = check_gcob_user() {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
+
     println!("=== Certificate Details ===\n");
 
     match inspect::parse_cert(cert_path) {
@@ -92,6 +209,11 @@ pub fn handle_show(cert_path: &Path) {
 
 /// Handle `gcob certs verify`
 pub fn handle_verify(cert_dir: &Path, expected_hostname: Option<&str>) {
+    if let Err(e) = check_gcob_user() {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
+
     let hostname = expected_hostname.unwrap_or("localhost");
 
     println!("=== Certificate Verification ===\n");
@@ -193,6 +315,11 @@ pub fn handle_verify(cert_dir: &Path, expected_hostname: Option<&str>) {
 
 /// Handle `gcob certs renew [--force]`
 pub fn handle_renew(cert_dir: &Path, force: bool) {
+    if let Err(e) = check_gcob_user() {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
+
     println!("=== Renewing Certificates ===\n");
 
     // Check if renewal is needed
@@ -311,17 +438,20 @@ pub fn handle_sign(csr_path: &Path, hostname: &str, output_dir: &Path) -> Result
 }
 
 /// Dispatch certs command
-pub fn dispatch(command: super::CertsCommand, cert_dir: &Path) {
+pub fn dispatch(command: super::CertsCommand) {
     match command {
+        super::CertsCommand::List { server } => handle_list(server),
         super::CertsCommand::Show { cert } => {
-            let cert_path = cert.unwrap_or_else(|| cert_dir.join("server.pem"));
+            let cert_path = cert.unwrap_or_else(|| PathBuf::from("/etc/gcob/certs/server.pem"));
             handle_show(&cert_path);
         }
         super::CertsCommand::Verify { hostname } => {
-            handle_verify(cert_dir, hostname.as_deref());
+            let cert_dir = PathBuf::from("/etc/gcob/certs");
+            handle_verify(&cert_dir, hostname.as_deref());
         }
         super::CertsCommand::Renew { force } => {
-            handle_renew(cert_dir, force);
+            let cert_dir = PathBuf::from("/etc/gcob/certs");
+            handle_renew(&cert_dir, force);
         }
     }
 }

@@ -74,14 +74,10 @@ async fn main() {
                 std::process::exit(1);
             }
         }
-        Commands::Certs { dir, command } => {
-            let cert_dir = dir.unwrap_or_else(|| {
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/root".to_string());
-                std::path::PathBuf::from(format!("{}/.gcob/certs", home))
-            });
+        Commands::Certs { dir: _, command } => {
             match command {
-                Some(cmd) => cli::certs::dispatch(cmd, &cert_dir),
-                None => cli::certs::handle_status(&cert_dir),
+                Some(cmd) => cli::certs::dispatch(cmd),
+                None => cli::certs::handle_no_subcommand(),
             }
         }
     }

@@ -116,6 +116,14 @@ fn is_root() -> bool {
     { false }
 }
 
+/// Check if this environment is a server (GRPC_BIND_ADDR configured in .env)
+pub fn is_server_env() -> bool {
+    dotenvy::dotenv().ok();
+    std::env::var("GRPC_BIND_ADDR")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
+}
+
 /// Server certificate paths (for HAProxy mTLS)
 pub struct ServerPaths {
     pub haproxy_cert_dir: PathBuf,
