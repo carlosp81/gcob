@@ -26,17 +26,15 @@ async fn main() {
         Commands::Init {
             client,
             server,
-            output_dir,
-            owner,
             force,
             client_hostname,
             client_ip,
+            no_confirm,
         } => {
             if client {
                 if let Err(e) = cli::server::handle_init_client(
-                    output_dir.as_deref(),
-                    owner.as_deref(),
                     force,
+                    no_confirm,
                     client_hostname.as_deref(),
                     client_ip.as_deref(),
                 ) {
@@ -49,8 +47,7 @@ async fn main() {
                     std::process::exit(1);
                 }
             } else {
-                eprintln!("Error: must specify --client or --server");
-                eprintln!("Usage: gcob init --client | gcob init --server");
+                eprintln!("Run 'gcob init --help' to see available options");
                 std::process::exit(1);
             }
         }

@@ -1,31 +1,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::certs::inspect;
-
-/// Verify current user is 'gcob'. In production, blocks execution.
-/// In development (GCOB_ENV=development), logs a warning and continues.
-fn check_gcob_user() -> Result<(), Box<dyn std::error::Error>> {
-    #[cfg(unix)]
-    {
-        let user = std::env::var("USER").unwrap_or_default();
-        if user != "gcob" {
-            let env = std::env::var("GCOB_ENV").unwrap_or_else(|_| "production".into());
-            if env == "development" {
-                tracing::warn!(
-                    "User validation skipped (development mode): current user is '{}'",
-                    user
-                );
-            } else {
-                return Err(format!(
-                    "Permission denied: only user 'gcob' can manage certificates. Current: '{}'",
-                    user
-                )
-                .into());
-            }
-        }
-    }
-    Ok(())
-}
+use crate::certs::paths::check_gcob_access;
 
 /// Handle `gcob certs` (no subcommand) — show usage help
 pub fn handle_no_subcommand() {
@@ -39,7 +15,7 @@ pub fn handle_no_subcommand() {
 
 /// Handle `gcob certs list [--server]`
 pub fn handle_list(server: bool) {
-    if let Err(e) = check_gcob_user() {
+    if let Err(e) = check_gcob_access() {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
@@ -167,7 +143,7 @@ fn print_cert_status(label: &str, dir: &Path, files: &[&str]) {
 
 /// Handle `gcob certs show --cert <FILE>`
 pub fn handle_show(cert_path: &Path) {
-    if let Err(e) = check_gcob_user() {
+    if let Err(e) = check_gcob_access() {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
@@ -209,7 +185,7 @@ pub fn handle_show(cert_path: &Path) {
 
 /// Handle `gcob certs verify`
 pub fn handle_verify(cert_dir: &Path, expected_hostname: Option<&str>) {
-    if let Err(e) = check_gcob_user() {
+    if let Err(e) = check_gcob_access() {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
@@ -315,7 +291,7 @@ pub fn handle_verify(cert_dir: &Path, expected_hostname: Option<&str>) {
 
 /// Handle `gcob certs renew [--force]`
 pub fn handle_renew(cert_dir: &Path, force: bool) {
-    if let Err(e) = check_gcob_user() {
+    if let Err(e) = check_gcob_access() {
         eprintln!("Error: {}", e);
         std::process::exit(1);
     }
@@ -392,6 +368,9 @@ pub fn handle_renew(cert_dir: &Path, force: bool) {
 
 /// Handle `gcob sign --csr <FILE> --hostname <HOST>`
 pub fn handle_sign(csr_path: &Path, hostname: &str, output_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+    // Validate user has permission to manage certificates
+    check_gcob_access().map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+
     println!("=== Signing Client Certificate ===\n");
     println!("  CSR:      {}", csr_path.display());
     println!("  Hostname: {}", hostname);

@@ -2,7 +2,8 @@ use std::fs;
 use std::path::Path;
 
 use crate::certs::generate::{self, CertError};
-use crate::certs::paths::{ClientPaths, ClnSourcePaths, ServerPaths};
+use crate::certs::paths::{check_gcob_access, ensure_cert_dir, setup_gcob_sudoers, ClientPaths, ClnSourcePaths, ServerPaths};
+use crate::certs::detect;
 
 const CLN_HOSTNAME_DEFAULT: &str = "localhost";
 const CLN_IP_DEFAULT: &str = "127.0.0.1";
@@ -10,32 +11,39 @@ const CLN_IP_DEFAULT: &str = "127.0.0.1";
 /// Handle `gcob init --client`
 /// Generates a CSR (Certificate Signing Request) - runs on CLIENT machine
 pub fn handle_init_client(
-    output_dir: Option<&Path>,
-    owner: Option<&str>,
     force: bool,
+    no_confirm: bool,
     client_hostname: Option<&str>,
     client_ip: Option<&str>,
 ) -> Result<(), CertError> {
-    // Resolve client hostname: CLI flag > env var > error
+    // Validate user has permission to manage certificates
+    check_gcob_access()?;
+
+    // Resolve client hostname: CLI flag > env var > auto-detect
     let client_hostname = match client_hostname {
         Some(h) => h.to_string(),
-        None => std::env::var("CLIENT_HOSTNAME").unwrap_or_else(|_| {
-            eprintln!("Error: Client hostname not specified");
-            eprintln!("  Use --client-hostname flag or CLIENT_HOSTNAME env var");
-            std::process::exit(1);
-        }),
+        None => match std::env::var("CLIENT_HOSTNAME") {
+            Ok(h) => h,
+            Err(_) => detect::detect_hostname().map_err(|e| {
+                CertError::Io(std::io::Error::other(format!(
+                    "Cannot detect hostname: {}. Use --client-hostname flag or CLIENT_HOSTNAME env var",
+                    e
+                )))
+            })?,
+        },
     };
 
-    // Resolve client IP: CLI flag > env var > optional
+    // Resolve client IP: CLI flag > env var > auto-detect
     let client_ip = match client_ip {
         Some(ip) => Some(ip.to_string()),
-        None => std::env::var("CLIENT_IP").ok(),
+        None => match std::env::var("CLIENT_IP") {
+            Ok(ip) => Some(ip),
+            Err(_) => detect::detect_ip().ok(), // Auto-detect is optional
+        },
     };
 
-    let client_paths = match output_dir {
-        Some(dir) => ClientPaths::new(&dir.to_string_lossy()),
-        None => ClientPaths::default_path(),
-    };
+    // Always use the canonical system path
+    let client_paths = ClientPaths::default_path();
 
     // Check if CSR already exists
     let csr_path = client_paths.cert_dir.join("client.csr");
@@ -45,65 +53,65 @@ pub fn handle_init_client(
         std::process::exit(1);
     }
 
+    // Show configuration and ask for confirmation
     println!("=== Initializing gcob client (CSR generation) ===");
+    println!();
     println!("  Hostname: {}", client_hostname);
     if let Some(ref ip) = client_ip {
         println!("  IP:       {}", ip);
     }
     println!("  Output:   {}", client_paths.cert_dir.display());
-    if let Some(o) = owner {
-        println!("  Owner:    {}", o);
-    }
     if force && csr_path.exists() {
         println!("  Mode:     Overwrite existing CSR");
     }
     println!();
 
-    // Validate directory is writable before proceeding
-    if let Err(e) = client_paths.validate_writable() {
-        eprintln!("Error: Cannot create certificate directory");
-        eprintln!("  Path: {}", client_paths.cert_dir.display());
-        eprintln!();
-        for line in e.lines() {
-            eprintln!("  {}", line);
+    // Ask for confirmation unless --no-confirm is passed
+    if !no_confirm {
+        print!("Proceed? [Y/n] ");
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).ok();
+        let input = input.trim().to_lowercase();
+
+        if input == "n" || input == "no" {
+            println!("Aborted.");
+            std::process::exit(0);
         }
-        std::process::exit(1);
+        println!();
     }
+
+    // If running as root, setup sudoers first
+    let uid = unsafe { libc::getuid() };
+    if uid == 0 {
+        setup_gcob_sudoers()?;
+    }
+
+    // Ensure certificate directory exists
+    ensure_cert_dir()?;
 
     // Step 1: Create output directory
-    println!("[1/4] Creating certificate directory...");
-    fs::create_dir_all(&client_paths.cert_dir)?;
-    println!("  [✓] {}", client_paths.cert_dir.display());
+    println!("[1/5] Creating certificate directory...");
 
     // Step 2: Generate CSR
-    println!("[2/4] Generating CSR...");
+    println!("[2/5] Generating CSR...");
     generate::generate_csr(&client_hostname, client_ip.as_deref(), &client_paths.cert_dir)?;
-    println!("  [✓] client.csr generated");
+    println!("[3/5] CSR generated successfully");
 
-    // Step 3: Set permissions
-    println!("[3/4] Setting permissions...");
+    // Step 3: Set permissions (silent)
     #[cfg(unix)]
     {
-        generate::set_permissions(&client_paths.cert_dir, 0o700)?;
-        generate::set_permissions(&client_paths.client_key_file, 0o400)?;
+        let _ = generate::set_permissions(&client_paths.cert_dir, 0o700);
+        let _ = generate::set_permissions(&client_paths.client_key_file, 0o400);
         let _ = generate::set_permissions(&client_paths.cert_dir.join("client.csr"), 0o444);
     }
-    println!("  [✓] Permissions set");
 
-    // Step 4: Chown to specified user
-    if let Some(user) = owner {
-        println!("[4/4] Changing ownership to {}...", user);
-        #[cfg(unix)]
-        {
-            chown_recursive(&client_paths.cert_dir, user)?;
-        }
-        #[cfg(not(unix))]
-        {
-            eprintln!("  [!] Warning: chown not supported on this platform");
-        }
-        println!("  [✓] Ownership changed to {}", user);
-    } else {
-        println!("[4/4] Skipping chown (no --owner specified)");
+    // Step 4: Chown to gcob user (silent)
+    #[cfg(unix)]
+    {
+        let _ = chown_recursive(&client_paths.cert_dir, "gcob");
     }
 
     println!();
@@ -150,6 +158,9 @@ fn chown_recursive(path: &Path, user: &str) -> Result<(), CertError> {
 /// Handle `gcob init --server`
 /// Generates all server certificates signed by CLN's CA
 pub fn handle_init_server() -> Result<(), CertError> {
+    // Validate user has permission to manage certificates
+    check_gcob_access()?;
+
     let hostname =
         std::env::var("CLN_HOSTNAME").unwrap_or_else(|_| CLN_HOSTNAME_DEFAULT.to_string());
     let ip = std::env::var("CLN_IP").unwrap_or_else(|_| CLN_IP_DEFAULT.to_string());

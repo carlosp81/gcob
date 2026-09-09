@@ -27,28 +27,21 @@ pub enum Commands {
         #[arg(long, conflicts_with = "client")]
         server: bool,
 
-        /// Output directory for client certs
-        /// Default: ~/.gcob/certs (requires writable home)
-        /// For system accounts: use --output-dir /var/lib/gcob/certs
-        #[arg(long)]
-        output_dir: Option<PathBuf>,
-
-        /// Chown certs to this user after creation
-        /// Requires root. Example: --owner gcob
-        #[arg(long)]
-        owner: Option<String>,
-
         /// Overwrite existing CSR/key files
         #[arg(long)]
         force: bool,
 
-        /// External client hostname (overrides CLIENT_HOSTNAME env var)
+        /// Hostname for client certificate (auto-detected if not specified)
         #[arg(long)]
         client_hostname: Option<String>,
 
-        /// External client IP for SAN (overrides CLIENT_IP env var)
+        /// IP address for client certificate SAN (auto-detected if not specified)
         #[arg(long)]
         client_ip: Option<String>,
+
+        /// Skip confirmation prompt (for scripting)
+        #[arg(long)]
+        no_confirm: bool,
     },
 
     /// Start the gRPC API server
