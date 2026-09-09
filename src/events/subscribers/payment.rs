@@ -10,29 +10,49 @@ use tonic::transport::Channel;
 use super::super::types::*;
 
 pub async fn run(client: &mut NodeClient<Channel>, tx: mpsc::Sender<Event>) {
-    let mut success_stream = client
+    let mut success_stream = match client
         .subscribe_send_pay_success(StreamSendPaySuccessRequest {})
         .await
-        .expect("subscribe_send_pay_success")
-        .into_inner();
+    {
+        Ok(resp) => resp.into_inner(),
+        Err(e) => {
+            tracing::warn!("subscribe_send_pay_success failed: {}", e);
+            return;
+        }
+    };
 
-    let mut failure_stream = client
+    let mut failure_stream = match client
         .subscribe_send_pay_failure(StreamSendPayFailureRequest {})
         .await
-        .expect("subscribe_send_pay_failure")
-        .into_inner();
+    {
+        Ok(resp) => resp.into_inner(),
+        Err(e) => {
+            tracing::warn!("subscribe_send_pay_failure failed: {}", e);
+            return;
+        }
+    };
 
-    let mut part_start_stream = client
+    let mut part_start_stream = match client
         .subscribe_pay_part_start(StreamPayPartStartRequest {})
         .await
-        .expect("subscribe_pay_part_start")
-        .into_inner();
+    {
+        Ok(resp) => resp.into_inner(),
+        Err(e) => {
+            tracing::warn!("subscribe_pay_part_start failed: {}", e);
+            return;
+        }
+    };
 
-    let mut part_end_stream = client
+    let mut part_end_stream = match client
         .subscribe_pay_part_end(StreamPayPartEndRequest {})
         .await
-        .expect("subscribe_pay_part_end")
-        .into_inner();
+    {
+        Ok(resp) => resp.into_inner(),
+        Err(e) => {
+            tracing::warn!("subscribe_pay_part_end failed: {}", e);
+            return;
+        }
+    };
 
     loop {
         tokio::select! {

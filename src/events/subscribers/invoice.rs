@@ -7,17 +7,27 @@ use tonic::transport::Channel;
 use super::super::types::*;
 
 pub async fn run(client: &mut NodeClient<Channel>, tx: mpsc::Sender<Event>) {
-    let mut creation_stream = client
+    let mut creation_stream = match client
         .subscribe_invoice_creation(StreamInvoiceCreationRequest {})
         .await
-        .expect("subscribe_invoice_creation")
-        .into_inner();
+    {
+        Ok(resp) => resp.into_inner(),
+        Err(e) => {
+            tracing::warn!("subscribe_invoice_creation failed: {}", e);
+            return;
+        }
+    };
 
-    let mut payment_stream = client
+    let mut payment_stream = match client
         .subscribe_invoice_payment(StreamInvoicePaymentRequest {})
         .await
-        .expect("subscribe_invoice_payment")
-        .into_inner();
+    {
+        Ok(resp) => resp.into_inner(),
+        Err(e) => {
+            tracing::warn!("subscribe_invoice_payment failed: {}", e);
+            return;
+        }
+    };
 
     loop {
         tokio::select! {

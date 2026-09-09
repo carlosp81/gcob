@@ -7,17 +7,27 @@ use tonic::transport::Channel;
 use super::super::types::*;
 
 pub async fn run(client: &mut NodeClient<Channel>, tx: mpsc::Sender<Event>) {
-    let mut connect_stream = client
+    let mut connect_stream = match client
         .subscribe_connect(StreamConnectRequest {})
         .await
-        .expect("subscribe_connect")
-        .into_inner();
+    {
+        Ok(resp) => resp.into_inner(),
+        Err(e) => {
+            tracing::warn!("subscribe_connect failed: {}", e);
+            return;
+        }
+    };
 
-    let mut disconnect_stream = client
+    let mut disconnect_stream = match client
         .subscribe_disconnect(StreamDisconnectRequest {})
         .await
-        .expect("subscribe_disconnect")
-        .into_inner();
+    {
+        Ok(resp) => resp.into_inner(),
+        Err(e) => {
+            tracing::warn!("subscribe_disconnect failed: {}", e);
+            return;
+        }
+    };
 
     loop {
         tokio::select! {
