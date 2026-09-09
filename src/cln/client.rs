@@ -43,7 +43,7 @@ impl ClnClient {
         let tls_config = ClientTlsConfig::new()
             .ca_certificate(ca_cert)
             .identity(client_identity)
-            .domain_name(&std::env::var("CLN_HOSTNAME").expect("CLN_HOSTNAME must be set"));
+            .domain_name(std::env::var("CLN_HOSTNAME").expect("CLN_HOSTNAME must be set"));
         let h2 = tls_config.assume_http2(true);
         // 5. Create tonic channel and gRPC client
         let channel = Endpoint::from_shared(config.node_uri.clone())?

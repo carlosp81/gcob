@@ -593,6 +593,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "prost",
  "rand",
  "rcgen",
@@ -611,6 +612,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "x509-parser",
 ]
 
 [[package]]

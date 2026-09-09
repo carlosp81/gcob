@@ -2,8 +2,8 @@ use std::fs;
 use std::path::Path;
 
 use rcgen::{
-    CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, Issuer, KeyPair,
-    SanType, SigningKey,
+    CertificateParams, CertificateSigningRequestParams, DistinguishedName, DnType,
+    ExtendedKeyUsagePurpose, Issuer, KeyPair, SanType, SigningKey,
 };
 
 use super::paths::ClnSourcePaths;
@@ -13,6 +13,7 @@ use super::paths::ClnSourcePaths;
 pub enum CertError {
     Io(std::io::Error),
     Rcgen(rcgen::Error),
+    Parse(String),
     MissingSource(String),
     InvalidIp(String),
 }
@@ -22,6 +23,7 @@ impl std::fmt::Display for CertError {
         match self {
             CertError::Io(e) => write!(f, "IO error: {}", e),
             CertError::Rcgen(e) => write!(f, "Certificate error: {}", e),
+            CertError::Parse(e) => write!(f, "Parse error: {}", e),
             CertError::MissingSource(e) => write!(f, "Missing source: {}", e),
             CertError::InvalidIp(e) => write!(f, "Invalid IP address: {}", e),
         }
@@ -144,6 +146,108 @@ pub fn concat_cert_key(
     let cert = fs::read_to_string(cert_path)?;
     let key = fs::read_to_string(key_path)?;
     fs::write(output_path, format!("{}{}", cert, key))?;
+    Ok(())
+}
+
+/// Generate a CSR (Certificate Signing Request) for a client
+/// This runs on the CLIENT machine - no CA needed
+pub fn generate_csr(hostname: &str, ip: Option<&str>, output_dir: &Path) -> Result<(), CertError> {
+    let client_key = KeyPair::generate().map_err(CertError::Rcgen)?;
+
+    // Build SAN list with hostname and optional IP
+    let mut san_names = vec![hostname.to_string()];
+    if let Some(ip_str) = ip {
+        // Validate IP format
+        let _ip_addr: std::net::IpAddr = ip_str
+            .parse()
+            .map_err(|_| CertError::InvalidIp(ip_str.to_string()))?;
+        san_names.push(ip_str.to_string());
+    }
+
+    let mut params =
+        CertificateParams::new(san_names).map_err(CertError::Rcgen)?;
+    params.distinguished_name = DistinguishedName::new();
+    params.distinguished_name.push(DnType::CommonName, hostname);
+    params
+        .extended_key_usages
+        .push(ExtendedKeyUsagePurpose::ClientAuth);
+
+    let csr = params
+        .serialize_request(&client_key)
+        .map_err(CertError::Rcgen)?;
+
+    // Write CSR
+    let csr_pem = csr.pem().map_err(CertError::Rcgen)?;
+    fs::write(output_dir.join("client.csr"), csr_pem)?;
+
+    // Write client key
+    fs::write(
+        output_dir.join("client-key.pem"),
+        client_key.serialize_pem(),
+    )?;
+
+    Ok(())
+}
+
+/// Sign a CSR with the CA - this runs on the SERVER
+pub fn sign_csr<S: SigningKey>(
+    csr_path: &Path,
+    issuer: &Issuer<'_, S>,
+    output_dir: &Path,
+) -> Result<(), CertError> {
+    let csr_pem = fs::read_to_string(csr_path)?;
+
+    let csr = CertificateSigningRequestParams::from_pem(&csr_pem)
+        .map_err(|e| CertError::Parse(format!("CSR parse error: {}", e)))?;
+
+    let cert = csr
+        .signed_by(issuer)
+        .map_err(|e| CertError::Parse(format!("CSR sign error: {}", e)))?;
+
+    // Write signed certificate
+    fs::write(output_dir.join("client.pem"), cert.pem())?;
+
+    Ok(())
+}
+
+/// Generate a server certificate for Bakog API (mTLS 1 server side)
+pub fn generate_api_server_cert<S: SigningKey>(
+    issuer: &Issuer<'_, S>,
+    hostname: &str,
+    ip: &str,
+    output_dir: &Path,
+) -> Result<(), CertError> {
+    let server_key = KeyPair::generate().map_err(CertError::Rcgen)?;
+
+    let ip_addr: std::net::IpAddr = ip
+        .parse()
+        .map_err(|_| CertError::InvalidIp(ip.to_string()))?;
+
+    let san_names = vec![hostname.to_string(), "localhost".to_string()];
+
+    let mut params = CertificateParams::new(san_names).map_err(CertError::Rcgen)?;
+    params.distinguished_name = DistinguishedName::new();
+    params
+        .distinguished_name
+        .push(DnType::CommonName, hostname);
+    params
+        .extended_key_usages
+        .push(ExtendedKeyUsagePurpose::ServerAuth);
+    params.subject_alt_names.push(SanType::IpAddress(ip_addr));
+
+    let cert = params
+        .signed_by(&server_key, issuer)
+        .map_err(CertError::Rcgen)?;
+
+    // Write server certificate
+    fs::write(output_dir.join("server-api.pem"), cert.pem())?;
+
+    // Write server key
+    fs::write(
+        output_dir.join("server-api-key.pem"),
+        server_key.serialize_pem(),
+    )?;
+
     Ok(())
 }
 
