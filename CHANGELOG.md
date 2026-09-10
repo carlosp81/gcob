@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.3.5] - 2026-09-10
+
+### Changed
+- Remove CA key copy to ~/.certs/ (reduce attack surface)
+- Eliminate dead code: generate_api_server_cert, *_api_* fields, setup_gcob_sudoers
+- Simplify verify_api_section (only verifies ca.pem)
+- Fix .env.server.example naming consistency (server-api.pem → server.pem)
+
+## [0.3.4] - 2026-09-09
+
+### Changed
+- Restructure gcob certs with role-based listing and user restrictions
+- Enhanced gcob init client with auto-detection, user restrictions
+- Enhanced gcob certs verify with client/server mode detection
+
 ## [0.3.3] - 2026-09-09
 
 ### Added
