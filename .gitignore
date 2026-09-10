@@ -19,12 +19,16 @@ ctx_genesis/
 *.key
 *.crt
 *.p12
+*.csr
+deb_cpim@*
+debian_cpim@*
 
 # Scripts (replaced by CLI)
 setup_certs.sh
 
 # Plans
 cli_plan.md
+ctx_gcob.md
 
 # IDE
 .vscode/

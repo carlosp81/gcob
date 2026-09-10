@@ -39,6 +39,14 @@ pub enum Commands {
         #[arg(long)]
         client_ip: Option<String>,
 
+        /// Hostname for server certificate (auto-detected if not specified)
+        #[arg(long, conflicts_with = "client")]
+        server_hostname: Option<String>,
+
+        /// IP address for server certificate SAN (auto-detected if not specified)
+        #[arg(long, conflicts_with = "client")]
+        server_ip: Option<String>,
+
         /// Skip confirmation prompt (for scripting)
         #[arg(long)]
         no_confirm: bool,

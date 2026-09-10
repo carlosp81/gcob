@@ -29,6 +29,8 @@ async fn main() {
             force,
             client_hostname,
             client_ip,
+            server_hostname,
+            server_ip,
             no_confirm,
         } => {
             if client {
@@ -42,7 +44,12 @@ async fn main() {
                     std::process::exit(1);
                 }
             } else if server {
-                if let Err(e) = cli::server::handle_init_server() {
+                if let Err(e) = cli::server::handle_init_server(
+                    force,
+                    no_confirm,
+                    server_hostname.as_deref(),
+                    server_ip.as_deref(),
+                ) {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }

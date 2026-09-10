@@ -5,9 +5,6 @@ use crate::certs::generate::{self, CertError};
 use crate::certs::paths::{check_gcob_access, ensure_cert_dir, setup_gcob_sudoers, ClientPaths, ClnSourcePaths, ServerPaths};
 use crate::certs::detect;
 
-const CLN_HOSTNAME_DEFAULT: &str = "localhost";
-const CLN_IP_DEFAULT: &str = "127.0.0.1";
-
 /// Handle `gcob init --client`
 /// Generates a CSR (Certificate Signing Request) - runs on CLIENT machine
 pub fn handle_init_client(
@@ -19,28 +16,15 @@ pub fn handle_init_client(
     // Validate user has permission to manage certificates
     check_gcob_access()?;
 
-    // Resolve client hostname: CLI flag > env var > auto-detect
-    let client_hostname = match client_hostname {
-        Some(h) => h.to_string(),
-        None => match std::env::var("CLIENT_HOSTNAME") {
-            Ok(h) => h,
-            Err(_) => detect::detect_hostname().map_err(|e| {
-                CertError::Io(std::io::Error::other(format!(
-                    "Cannot detect hostname: {}. Use --client-hostname flag or CLIENT_HOSTNAME env var",
-                    e
-                )))
-            })?,
-        },
-    };
-
-    // Resolve client IP: CLI flag > env var > auto-detect
-    let client_ip = match client_ip {
-        Some(ip) => Some(ip.to_string()),
-        None => match std::env::var("CLIENT_IP") {
-            Ok(ip) => Some(ip),
-            Err(_) => detect::detect_ip().ok(), // Auto-detect is optional
-        },
-    };
+    // Resolve identity: CLI flag > env var > auto-detect > default
+    let identity = detect::resolve_identity(
+        client_hostname, client_ip,
+        "CLIENT_HOSTNAME", "CLIENT_IP",
+        "localhost", "127.0.0.1",
+        false, // IP optional for client
+    )?;
+    let client_hostname = identity.hostname;
+    let client_ip = identity.ip;
 
     // Always use the canonical system path
     let client_paths = ClientPaths::default_path();
@@ -157,13 +141,24 @@ fn chown_recursive(path: &Path, user: &str) -> Result<(), CertError> {
 
 /// Handle `gcob init --server`
 /// Generates all server certificates signed by CLN's CA
-pub fn handle_init_server() -> Result<(), CertError> {
+pub fn handle_init_server(
+    _force: bool,
+    _no_confirm: bool,
+    server_hostname: Option<&str>,
+    server_ip: Option<&str>,
+) -> Result<(), CertError> {
     // Validate user has permission to manage certificates
     check_gcob_access()?;
 
-    let hostname =
-        std::env::var("CLN_HOSTNAME").unwrap_or_else(|_| CLN_HOSTNAME_DEFAULT.to_string());
-    let ip = std::env::var("CLN_IP").unwrap_or_else(|_| CLN_IP_DEFAULT.to_string());
+    // Resolve identity: CLI flag > env var > auto-detect > default
+    let identity = detect::resolve_identity(
+        server_hostname, server_ip,
+        "CLN_HOSTNAME", "CLN_IP",
+        "localhost", "127.0.0.1",
+        true, // IP required for server
+    )?;
+    let hostname = identity.hostname;
+    let ip = identity.ip.unwrap(); // safe: require_ip=true
     let cln_source = ClnSourcePaths::default_home();
     let server_paths = ServerPaths::default_path();
     let client_paths = ClientPaths::default_path();
@@ -194,6 +189,11 @@ pub fn handle_init_server() -> Result<(), CertError> {
     generate::copy_file(&cln_source.ca_file, &server_paths.ca_file)?;
     generate::copy_file(&cln_source.ca_key_file, &server_paths.ca_key_file)?;
     println!("  [✓] ca.pem copied");
+
+    // Step 3b: Copy CA to /etc/gcob/certs/ for API verification
+    generate::copy_file(&cln_source.ca_file, &client_paths.ca_file)?;
+    generate::copy_file(&cln_source.ca_key_file, &client_paths.ca_key_file)?;
+    println!("  [✓] ca.pem + ca-key.pem copied to /etc/gcob/certs/");
 
     // Step 4: Generate HAProxy server cert (mTLS 2 server side)
     let temp_dir = Path::new("/tmp/gcob_certs");
@@ -254,6 +254,8 @@ pub fn handle_init_server() -> Result<(), CertError> {
         generate::set_permissions(&server_paths.server_concat_file, 0o600)?;
         generate::set_permissions(&server_paths.client_concat_file, 0o600)?;
         generate::set_permissions(&client_paths.cert_dir, 0o700)?;
+        let _ = generate::set_permissions(&client_paths.ca_file, 0o444);
+        let _ = generate::set_permissions(&client_paths.ca_key_file, 0o400);
         let _ = generate::set_permissions(&client_paths.cert_dir.join("server-api.pem"), 0o444);
         let _ = generate::set_permissions(&client_paths.cert_dir.join("server-api-key.pem"), 0o400);
         let _ = generate::set_permissions(&client_paths.cert_dir.join("client-api.pem"), 0o444);

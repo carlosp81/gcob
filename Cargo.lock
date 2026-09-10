@@ -581,7 +581,7 @@ dependencies = [
 
 [[package]]
 name = "gcob"
-version = "0.3.2"
+version = "0.3.4"
 dependencies = [
  "anyhow",
  "bytes",

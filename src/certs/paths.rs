@@ -12,11 +12,14 @@ const CLN_SOURCE_DIR_DEFAULT: &str = ".lightning/bitcoin";
 /// Client certificate paths (for gcob gRPC client)
 pub struct ClientPaths {
     pub cert_dir: PathBuf,
-    #[allow(dead_code)]
     pub ca_file: PathBuf,
-    #[allow(dead_code)]
+    pub ca_key_file: PathBuf,
     pub client_file: PathBuf,
     pub client_key_file: PathBuf,
+    pub server_api_file: PathBuf,
+    pub server_api_key_file: PathBuf,
+    pub client_api_file: PathBuf,
+    pub client_api_key_file: PathBuf,
 }
 
 impl ClientPaths {
@@ -24,8 +27,13 @@ impl ClientPaths {
         let dir = PathBuf::from(cert_dir);
         Self {
             ca_file: dir.join("ca.pem"),
+            ca_key_file: dir.join("ca-key.pem"),
             client_file: dir.join("client.pem"),
             client_key_file: dir.join("client-key.pem"),
+            server_api_file: dir.join("server-api.pem"),
+            server_api_key_file: dir.join("server-api-key.pem"),
+            client_api_file: dir.join("client-api.pem"),
+            client_api_key_file: dir.join("client-api-key.pem"),
             cert_dir: dir,
         }
     }
@@ -35,12 +43,17 @@ impl ClientPaths {
     }
 }
 
-/// Check if this environment is a server (GRPC_BIND_ADDR configured in .env)
+/// Check if this environment is a server (GRPC_BIND_ADDR configured in .env + server certs exist)
 pub fn is_server_env() -> bool {
     dotenvy::dotenv().ok();
-    std::env::var("GRPC_BIND_ADDR")
+    let has_grpc = std::env::var("GRPC_BIND_ADDR")
         .map(|v| !v.is_empty())
-        .unwrap_or(false)
+        .unwrap_or(false);
+    
+    // Verificar también que existan certificados de servidor
+    let has_server_certs = Path::new("/etc/haproxy/certs").exists();
+    
+    has_grpc && has_server_certs
 }
 
 /// Get username from UID using getpwuid
