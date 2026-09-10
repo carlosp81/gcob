@@ -75,31 +75,50 @@ pub enum Commands {
 
 #[derive(Subcommand)]
 pub enum CertsCommand {
-    /// List certificate status
+    /// List certificate status with expiry information
     List {
         /// Show server certificates (HAProxy + CLN)
         #[arg(long, hide = true)]
         server: bool,
     },
 
-    /// Show detailed certificate information
+    /// Show detailed certificate information (subject, issuer, SANs, expiry)
     Show {
         /// Path to certificate file
         #[arg(long)]
         cert: Option<PathBuf>,
     },
 
-    /// Verify chain of trust and SANs
+    /// Verify chain of trust and SANs against expected hostname
     Verify {
-        /// Expected hostname for SAN validation
+        /// Expected hostname for SAN validation (default: localhost)
         #[arg(long)]
         hostname: Option<String>,
+
+        /// What to verify
+        #[command(subcommand)]
+        target: Option<VerifySubcommand>,
     },
 
-    /// Renew certificates
+    /// Renew expired or expiring certificates
     Renew {
         /// Force renewal even if not expired
         #[arg(long)]
         force: bool,
     },
+}
+
+#[derive(Subcommand)]
+pub enum VerifySubcommand {
+    /// Verify only the CA certificate
+    Ca,
+
+    /// Verify only the server certificate
+    Server,
+
+    /// Verify only the client certificate
+    Client,
+
+    /// Verify all certificates (default)
+    All,
 }

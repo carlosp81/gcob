@@ -1,16 +1,29 @@
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::certs::inspect;
-use crate::certs::paths::check_gcob_access;
+use crate::certs::paths::{check_gcob_access, is_server_env, ClnSourcePaths, ServerPaths};
+use super::VerifySubcommand;
 
 /// Handle `gcob certs` (no subcommand) — show usage help
 pub fn handle_no_subcommand() {
-    println!("Manage mTLS certificates for Bakog API and HAProxy.\n");
-    println!("Usage:");
-    println!("  gcob certs list              List client certificate status");
-    println!("  gcob certs show --cert FILE  Show detailed certificate info");
-    println!("  gcob certs verify            Verify chain of trust and SANs");
-    println!("  gcob certs renew             Renew certificates");
+    println!("Manage mTLS certificates for gcob.\n");
+
+    println!("USAGE:");
+    println!("    gcob certs list                  List certificate status");
+    println!("    gcob certs show --cert <FILE>    Show detailed certificate info");
+    println!("    gcob certs verify                Verify chain of trust and SANs");
+    println!("    gcob certs renew                 Renew expired certificates\n");
+
+    println!("EXAMPLES:");
+    println!("    gcob certs list                  # Show all certificates");
+    println!("    gcob certs verify                # Verify with localhost");
+    println!("    gcob certs verify --hostname my-server  # Verify with custom hostname");
+    println!("    gcob certs show --cert /etc/gcob/certs/client.pem\n");
+
+    println!("SAN CHECK:");
+    println!("    Verify that certificate SANs match the expected hostname.");
+    println!("    Supported SAN types: DNS, IP Address");
 }
 
 /// Handle `gcob certs list [--server]`
@@ -183,47 +196,79 @@ pub fn handle_show(cert_path: &Path) {
     }
 }
 
-/// Handle `gcob certs verify`
-pub fn handle_verify(cert_dir: &Path, expected_hostname: Option<&str>) {
-    if let Err(e) = check_gcob_access() {
-        eprintln!("Error: {}", e);
-        std::process::exit(1);
-    }
+/// Verify API certificates section (server only)
+fn verify_api_section(cert_dir: &Path, hostname: &str) -> Vec<bool> {
+    println!("── API Certificates ({}) ──\n", cert_dir.display());
+    let mut results = Vec::new();
 
-    let hostname = expected_hostname.unwrap_or("localhost");
-
-    println!("=== Certificate Verification ===\n");
-
-    // Check CA exists
+    // 1. ca.pem
     let ca_path = cert_dir.join("ca.pem");
     if !ca_path.exists() {
-        eprintln!("Error: CA certificate not found at {}", ca_path.display());
-        std::process::exit(1);
-    }
-
-    match inspect::parse_cert(&ca_path) {
-        Ok(info) => {
-            println!("  [1/3] ca.pem");
-            println!("        Subject: {}", info.subject);
-            println!("        Is CA:   {}", info.is_ca);
-            if info.is_ca {
-                println!("        Status:  ✓ Self-signed CA");
-            } else {
-                println!("        Status:  ✗ Not a CA certificate");
+        println!("  [1/6] ca.pem: ✗ Not found");
+        results.push(false);
+    } else {
+        match inspect::parse_cert(&ca_path) {
+            Ok(info) => {
+                println!("  [1/6] ca.pem");
+                println!("        Subject: {}", info.subject);
+                println!("        Is CA:   {}", info.is_ca);
+                if info.is_ca {
+                    println!("        Status:  ✓ Self-signed CA");
+                } else {
+                    println!("        Status:  ✗ Not a CA certificate");
+                }
+                results.push(true);
+            }
+            Err(e) => {
+                println!("  [1/6] ca.pem: ✗ Parse error: {}", e);
+                results.push(false);
             }
         }
-        Err(e) => {
-            eprintln!("  [1/3] ca.pem: ✗ Parse error: {}", e);
-            std::process::exit(1);
+    }
+
+    // 2. ca-key.pem
+    let ca_key_path = cert_dir.join("ca-key.pem");
+    if !ca_key_path.exists() {
+        println!("\n  [2/6] ca-key.pem: ✗ Not found");
+        results.push(false);
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            match fs::metadata(&ca_key_path) {
+                Ok(meta) => {
+                    let mode = meta.permissions().mode() & 0o777;
+                    println!("\n  [2/6] ca-key.pem");
+                    if mode == 0o400 {
+                        println!("        Permissions: ✓ 0400 (read-only)");
+                        results.push(true);
+                    } else {
+                        println!("        Permissions: ✗ {:04o} (expected 0400)", mode);
+                        results.push(false);
+                    }
+                }
+                Err(e) => {
+                    println!("\n  [2/6] ca-key.pem: ✗ {}", e);
+                    results.push(false);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            println!("\n  [2/6] ca-key.pem: ✓ Exists");
+            results.push(true);
         }
     }
 
-    // Verify server cert
-    let server_path = cert_dir.join("server.pem");
-    if server_path.exists() {
-        match inspect::verify_signed_by(&server_path, &ca_path) {
+    // 3. server-api.pem
+    let server_api_path = cert_dir.join("server-api.pem");
+    if !server_api_path.exists() {
+        println!("\n  [3/6] server-api.pem: ✗ Not found");
+        results.push(false);
+    } else {
+        match inspect::verify_signed_by(&server_api_path, &ca_path) {
             Ok(result) => {
-                println!("\n  [2/3] server.pem");
+                println!("\n  [3/6] server-api.pem");
                 println!("        Subject: {}", result.subject);
                 println!("        Issuer:  {}", result.issuer);
 
@@ -242,27 +287,77 @@ pub fn handle_verify(cert_dir: &Path, expected_hostname: Option<&str>) {
                     println!("        Expiry:  ✓ Valid ({} days remaining)", result.days_remaining);
                 }
 
-                // SAN check
-                match inspect::check_san_match(&server_path, hostname) {
-                    Ok(true) => println!("        SAN:     ✓ Matches '{}'", hostname),
-                    Ok(false) => println!("        SAN:     ✗ Does NOT match '{}'", hostname),
-                    Err(e) => println!("        SAN:     ✗ Error: {}", e),
+                // Show SANs
+                match inspect::parse_cert(&server_api_path) {
+                    Ok(info) => {
+                        if !info.sans.is_empty() {
+                            println!("        SANs:");
+                            for san in &info.sans {
+                                println!("          - {}", san);
+                            }
+                        }
+                    }
+                    Err(_) => {}
                 }
+
+                // SAN check
+                match inspect::check_san_match(&server_api_path, hostname) {
+                    Ok(true) => println!("        SAN Check: ✓ Matches '{}'", hostname),
+                    Ok(false) => println!("        SAN Check: ✗ Does NOT match '{}'", hostname),
+                    Err(e) => println!("        SAN Check: ✗ Error: {}", e),
+                }
+                results.push(true);
             }
             Err(e) => {
-                println!("\n  [2/3] server.pem: ✗ Error: {}", e);
+                println!("\n  [3/6] server-api.pem: ✗ Error: {}", e);
+                results.push(false);
             }
         }
-    } else {
-        println!("\n  [2/3] server.pem: ✗ Not found");
     }
 
-    // Verify client cert
-    let client_path = cert_dir.join("client.pem");
-    if client_path.exists() {
-        match inspect::verify_signed_by(&client_path, &ca_path) {
+    // 4. server-api-key.pem
+    let server_api_key_path = cert_dir.join("server-api-key.pem");
+    if !server_api_key_path.exists() {
+        println!("\n  [4/6] server-api-key.pem: ✗ Not found");
+        results.push(false);
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            match fs::metadata(&server_api_key_path) {
+                Ok(meta) => {
+                    let mode = meta.permissions().mode() & 0o777;
+                    println!("\n  [4/6] server-api-key.pem");
+                    if mode == 0o400 {
+                        println!("        Permissions: ✓ 0400 (read-only)");
+                        results.push(true);
+                    } else {
+                        println!("        Permissions: ✗ {:04o} (expected 0400)", mode);
+                        results.push(false);
+                    }
+                }
+                Err(e) => {
+                    println!("\n  [4/6] server-api-key.pem: ✗ {}", e);
+                    results.push(false);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            println!("\n  [4/6] server-api-key.pem: ✓ Exists");
+            results.push(true);
+        }
+    }
+
+    // 5. client-api.pem
+    let client_api_path = cert_dir.join("client-api.pem");
+    if !client_api_path.exists() {
+        println!("\n  [5/6] client-api.pem: ✗ Not found");
+        results.push(false);
+    } else {
+        match inspect::verify_signed_by(&client_api_path, &ca_path) {
             Ok(result) => {
-                println!("\n  [3/3] client.pem");
+                println!("\n  [5/6] client-api.pem");
                 println!("        Subject: {}", result.subject);
                 println!("        Issuer:  {}", result.issuer);
 
@@ -277,16 +372,584 @@ pub fn handle_verify(cert_dir: &Path, expected_hostname: Option<&str>) {
                 } else {
                     println!("        Expiry:  ✓ Valid ({} days remaining)", result.days_remaining);
                 }
+
+                // Show SANs
+                match inspect::parse_cert(&client_api_path) {
+                    Ok(info) => {
+                        if !info.sans.is_empty() {
+                            println!("        SANs:");
+                            for san in &info.sans {
+                                println!("          - {}", san);
+                            }
+                        }
+                    }
+                    Err(_) => {}
+                }
+                results.push(true);
             }
             Err(e) => {
-                println!("\n  [3/3] client.pem: ✗ Error: {}", e);
+                println!("\n  [5/6] client-api.pem: ✗ Error: {}", e);
+                results.push(false);
             }
         }
-    } else {
-        println!("\n  [3/3] client.pem: ✗ Not found");
     }
 
-    println!("\nChain of trust verification complete.");
+    // 6. client-api-key.pem
+    let client_api_key_path = cert_dir.join("client-api-key.pem");
+    if !client_api_key_path.exists() {
+        println!("\n  [6/6] client-api-key.pem: ✗ Not found");
+        results.push(false);
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            match fs::metadata(&client_api_key_path) {
+                Ok(meta) => {
+                    let mode = meta.permissions().mode() & 0o777;
+                    println!("\n  [6/6] client-api-key.pem");
+                    if mode == 0o400 {
+                        println!("        Permissions: ✓ 0400 (read-only)");
+                        results.push(true);
+                    } else {
+                        println!("        Permissions: ✗ {:04o} (expected 0400)", mode);
+                        results.push(false);
+                    }
+                }
+                Err(e) => {
+                    println!("\n  [6/6] client-api-key.pem: ✗ {}", e);
+                    results.push(false);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            println!("\n  [6/6] client-api-key.pem: ✓ Exists");
+            results.push(true);
+        }
+    }
+
+    results
+}
+
+/// Verify HAProxy certificates section (server only)
+fn verify_haproxy_section(haproxy_dir: &Path, client_cert_dir: &Path, hostname: &str) -> Vec<bool> {
+    println!("\n── HAProxy Certificates ({}) ──\n", haproxy_dir.display());
+    let mut results = Vec::new();
+
+    let ca_dir = haproxy_dir.join("ca-certs");
+
+    // 1. ca-certs/ca.pem
+    let ca_path = ca_dir.join("ca.pem");
+    if !ca_path.exists() {
+        println!("  [1/4] ca-certs/ca.pem: ✗ Not found");
+        results.push(false);
+    } else {
+        match inspect::parse_cert(&ca_path) {
+            Ok(info) => {
+                println!("  [1/4] ca-certs/ca.pem");
+                println!("        Subject: {}", info.subject);
+                println!("        Is CA:   {}", info.is_ca);
+                if info.is_ca {
+                    println!("        Status:  ✓ Self-signed CA");
+                } else {
+                    println!("        Status:  ✗ Not a CA certificate");
+                }
+
+                // Compare with client cert dir CA
+                let client_ca = client_cert_dir.join("ca.pem");
+                if client_ca.exists() {
+                    match (fs::read(&ca_path), fs::read(&client_ca)) {
+                        (Ok(a), Ok(b)) => {
+                            if a == b {
+                                println!("        Compare: ✓ Matches {}", client_ca.display());
+                            } else {
+                                println!("        Compare: ✗ Does NOT match {}", client_ca.display());
+                            }
+                        }
+                        _ => {
+                            println!("        Compare: ✗ Error reading files");
+                        }
+                    }
+                }
+                results.push(true);
+            }
+            Err(e) => {
+                println!("  [1/4] ca-certs/ca.pem: ✗ Parse error: {}", e);
+                results.push(false);
+            }
+        }
+    }
+
+    // 2. ca-certs/ca-key.pem
+    let ca_key_path = ca_dir.join("ca-key.pem");
+    if !ca_key_path.exists() {
+        println!("\n  [2/4] ca-certs/ca-key.pem: ✗ Not found");
+        results.push(false);
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            match fs::metadata(&ca_key_path) {
+                Ok(meta) => {
+                    let mode = meta.permissions().mode() & 0o777;
+                    println!("\n  [2/4] ca-certs/ca-key.pem");
+                    if mode == 0o400 {
+                        println!("        Permissions: ✓ 0400 (read-only)");
+                        results.push(true);
+                    } else {
+                        println!("        Permissions: ✗ {:04o} (expected 0400)", mode);
+                        results.push(false);
+                    }
+                }
+                Err(e) => {
+                    println!("\n  [2/4] ca-certs/ca-key.pem: ✗ {}", e);
+                    results.push(false);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            println!("\n  [2/4] ca-certs/ca-key.pem: ✓ Exists");
+            results.push(true);
+        }
+    }
+
+    // 3. cert_server_concat.pem
+    let server_concat_path = haproxy_dir.join("cert_server_concat.pem");
+    if !server_concat_path.exists() {
+        println!("\n  [3/4] cert_server_concat.pem: ✗ Not found");
+        results.push(false);
+    } else {
+        match inspect::verify_signed_by(&server_concat_path, &ca_path) {
+            Ok(result) => {
+                println!("\n  [3/4] cert_server_concat.pem");
+                println!("        Subject: {}", result.subject);
+                println!("        Issuer:  {}", result.issuer);
+
+                if result.signed_by_ca {
+                    println!("        Chain:   ✓ Signed by CA");
+                } else {
+                    println!("        Chain:   ✗ NOT signed by CA");
+                    for err in &result.errors {
+                        println!("               Error: {}", err);
+                    }
+                }
+
+                if result.expired {
+                    println!("        Expiry:  ✗ Expired ({} days ago)", -result.days_remaining);
+                } else {
+                    println!("        Expiry:  ✓ Valid ({} days remaining)", result.days_remaining);
+                }
+
+                // Show SANs
+                match inspect::parse_cert(&server_concat_path) {
+                    Ok(info) => {
+                        if !info.sans.is_empty() {
+                            println!("        SANs:");
+                            for san in &info.sans {
+                                println!("          - {}", san);
+                            }
+                        }
+                    }
+                    Err(_) => {}
+                }
+
+                // SAN check
+                match inspect::check_san_match(&server_concat_path, hostname) {
+                    Ok(true) => println!("        SAN Check: ✓ Matches '{}'", hostname),
+                    Ok(false) => println!("        SAN Check: ✗ Does NOT match '{}'", hostname),
+                    Err(e) => println!("        SAN Check: ✗ Error: {}", e),
+                }
+                results.push(true);
+            }
+            Err(e) => {
+                println!("\n  [3/4] cert_server_concat.pem: ✗ Error: {}", e);
+                results.push(false);
+            }
+        }
+    }
+
+    // 4. cert_client_concat.pem
+    let client_concat_path = haproxy_dir.join("cert_client_concat.pem");
+    if !client_concat_path.exists() {
+        println!("\n  [4/4] cert_client_concat.pem: ✗ Not found");
+        results.push(false);
+    } else {
+        match inspect::verify_signed_by(&client_concat_path, &ca_path) {
+            Ok(result) => {
+                println!("\n  [4/4] cert_client_concat.pem");
+                println!("        Subject: {}", result.subject);
+                println!("        Issuer:  {}", result.issuer);
+
+                if result.signed_by_ca {
+                    println!("        Chain:   ✓ Signed by CA");
+                } else {
+                    println!("        Chain:   ✗ NOT signed by CA");
+                }
+
+                if result.expired {
+                    println!("        Expiry:  ✗ Expired ({} days ago)", -result.days_remaining);
+                } else {
+                    println!("        Expiry:  ✓ Valid ({} days remaining)", result.days_remaining);
+                }
+
+                // Show SANs
+                match inspect::parse_cert(&client_concat_path) {
+                    Ok(info) => {
+                        if !info.sans.is_empty() {
+                            println!("        SANs:");
+                            for san in &info.sans {
+                                println!("          - {}", san);
+                            }
+                        }
+                    }
+                    Err(_) => {}
+                }
+                results.push(true);
+            }
+            Err(e) => {
+                println!("\n  [4/4] cert_client_concat.pem: ✗ Error: {}", e);
+                results.push(false);
+            }
+        }
+    }
+
+    results
+}
+
+/// Verify CLN certificates section (server only)
+fn verify_cln_section(cln_dir: &Path, client_cert_dir: &Path) -> Vec<bool> {
+    println!("\n── CLN Certificates ({}) ──\n", cln_dir.display());
+    let mut results = Vec::new();
+
+    // Check if directory exists
+    if !cln_dir.exists() {
+        println!("  ⚠ Skipped: Directory not found ({})", cln_dir.display());
+        println!("  Core Lightning node may not be installed on this server.");
+        return results;
+    }
+
+    // 1. ca.pem
+    let ca_path = cln_dir.join("ca.pem");
+    if !ca_path.exists() {
+        println!("  [1/3] ca.pem: ✗ Not found");
+        results.push(false);
+    } else {
+        match inspect::parse_cert(&ca_path) {
+            Ok(info) => {
+                println!("  [1/3] ca.pem");
+                println!("        Subject: {}", info.subject);
+                println!("        Is CA:   {}", info.is_ca);
+                if info.is_ca {
+                    println!("        Status:  ✓ Self-signed CA");
+                } else {
+                    println!("        Status:  ✗ Not a CA certificate");
+                }
+
+                // Compare with client cert dir CA
+                let client_ca = client_cert_dir.join("ca.pem");
+                if client_ca.exists() {
+                    match (fs::read(&ca_path), fs::read(&client_ca)) {
+                        (Ok(a), Ok(b)) => {
+                            if a == b {
+                                println!("        Compare: ✓ Matches {}", client_ca.display());
+                            } else {
+                                println!("        Compare: ✗ Does NOT match {}", client_ca.display());
+                            }
+                        }
+                        _ => {
+                            println!("        Compare: ✗ Error reading files");
+                        }
+                    }
+                }
+                results.push(true);
+            }
+            Err(e) => {
+                println!("  [1/3] ca.pem: ✗ Parse error: {}", e);
+                results.push(false);
+            }
+        }
+    }
+
+    // 2. ca-key.pem
+    let ca_key_path = cln_dir.join("ca-key.pem");
+    if !ca_key_path.exists() {
+        println!("\n  [2/3] ca-key.pem: ✗ Not found");
+        results.push(false);
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            match fs::metadata(&ca_key_path) {
+                Ok(meta) => {
+                    let mode = meta.permissions().mode() & 0o777;
+                    println!("\n  [2/3] ca-key.pem");
+                    if mode == 0o400 {
+                        println!("        Permissions: ✓ 0400 (read-only)");
+                        results.push(true);
+                    } else {
+                        println!("        Permissions: ✗ {:04o} (expected 0400)", mode);
+                        results.push(false);
+                    }
+                }
+                Err(e) => {
+                    println!("\n  [2/3] ca-key.pem: ✗ {}", e);
+                    results.push(false);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            println!("\n  [2/3] ca-key.pem: ✓ Exists");
+            results.push(true);
+        }
+    }
+
+    // 3. server-key.pem
+    let server_key_path = cln_dir.join("server-key.pem");
+    if !server_key_path.exists() {
+        println!("\n  [3/3] server-key.pem: ✗ Not found");
+        results.push(false);
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            match fs::metadata(&server_key_path) {
+                Ok(meta) => {
+                    let mode = meta.permissions().mode() & 0o777;
+                    println!("\n  [3/3] server-key.pem");
+                    if mode == 0o400 {
+                        println!("        Permissions: ✓ 0400 (read-only)");
+                        results.push(true);
+                    } else {
+                        println!("        Permissions: ✗ {:04o} (expected 0400)", mode);
+                        results.push(false);
+                    }
+                }
+                Err(e) => {
+                    println!("\n  [3/3] server-key.pem: ✗ {}", e);
+                    results.push(false);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            println!("\n  [3/3] server-key.pem: ✓ Exists");
+            results.push(true);
+        }
+    }
+
+    results
+}
+
+/// Verify CA certificate section
+fn verify_ca_section(cert_dir: &Path) -> Vec<bool> {
+    let mut results = Vec::new();
+
+    let ca_path = cert_dir.join("ca.pem");
+    if !ca_path.exists() {
+        println!("  [1/1] ca.pem: ✗ Not found");
+        results.push(false);
+    } else {
+        match inspect::parse_cert(&ca_path) {
+            Ok(info) => {
+                println!("  [1/1] ca.pem");
+                println!("        Subject: {}", info.subject);
+                println!("        Is CA:   {}", info.is_ca);
+                if info.is_ca {
+                    println!("        Status:  ✓ Self-signed CA");
+                } else {
+                    println!("        Status:  ✗ Not a CA certificate");
+                }
+                results.push(true);
+            }
+            Err(e) => {
+                println!("  [1/1] ca.pem: ✗ Parse error: {}", e);
+                results.push(false);
+            }
+        }
+    }
+
+    results
+}
+
+/// Handle `gcob certs verify`
+pub fn handle_verify(cert_dir: &Path, expected_hostname: Option<&str>, target: Option<VerifySubcommand>) {
+    if let Err(e) = check_gcob_access() {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
+
+    let hostname = expected_hostname.unwrap_or("localhost");
+    let target = target.unwrap_or(VerifySubcommand::All);
+    let is_server = is_server_env();
+
+    if is_server {
+        println!("=== Certificate Verification (Server Mode) ===\n");
+    } else {
+        println!("=== Certificate Verification (Client Mode) ===\n");
+    }
+
+    let mut all_results = Vec::new();
+
+    match target {
+        VerifySubcommand::Ca => {
+            all_results.extend(verify_ca_section(cert_dir));
+        }
+        VerifySubcommand::Server => {
+            if is_server {
+                let server_paths = ServerPaths::default_path();
+                let cln_source = ClnSourcePaths::default_home();
+                all_results.extend(verify_haproxy_section(&server_paths.haproxy_cert_dir, cert_dir, hostname));
+                all_results.extend(verify_cln_section(&cln_source.dir, cert_dir));
+            } else {
+                println!("⚠ Warning: 'verify server' is not applicable in client mode.");
+                println!("  Server certificates are only available on server machines.");
+                println!("  Use 'gcob certs verify' to verify client certificates.\n");
+            }
+        }
+        VerifySubcommand::Client => {
+            all_results.extend(verify_client_section(cert_dir, hostname));
+        }
+        VerifySubcommand::All => {
+            // Client certificates (always)
+            all_results.extend(verify_client_section(cert_dir, hostname));
+
+            // Server sections (only on server)
+            if is_server {
+                let server_paths = ServerPaths::default_path();
+                let cln_source = ClnSourcePaths::default_home();
+                all_results.extend(verify_api_section(cert_dir, hostname));
+                all_results.extend(verify_haproxy_section(&server_paths.haproxy_cert_dir, cert_dir, hostname));
+                all_results.extend(verify_cln_section(&cln_source.dir, cert_dir));
+            }
+        }
+    }
+
+    let passed = all_results.iter().filter(|&&x| x).count();
+    let total = all_results.len();
+    println!("\nVerification complete: {}/{} passed", passed, total);
+}
+
+/// Verify client certificates section
+fn verify_client_section(cert_dir: &Path, hostname: &str) -> Vec<bool> {
+    let mut results = Vec::new();
+
+    // 1. ca.pem
+    let ca_path = cert_dir.join("ca.pem");
+    if !ca_path.exists() {
+        println!("  [1/3] ca.pem: ✗ Not found");
+        results.push(false);
+    } else {
+        match inspect::parse_cert(&ca_path) {
+            Ok(info) => {
+                println!("  [1/3] ca.pem");
+                println!("        Subject: {}", info.subject);
+                println!("        Is CA:   {}", info.is_ca);
+                if info.is_ca {
+                    println!("        Status:  ✓ Self-signed CA");
+                } else {
+                    println!("        Status:  ✗ Not a CA certificate");
+                }
+                results.push(true);
+            }
+            Err(e) => {
+                println!("  [1/3] ca.pem: ✗ Parse error: {}", e);
+                results.push(false);
+            }
+        }
+    }
+
+    // 2. client.pem
+    let client_path = cert_dir.join("client.pem");
+    if !client_path.exists() {
+        println!("\n  [2/3] client.pem: ✗ Not found");
+        results.push(false);
+    } else {
+        match inspect::verify_signed_by(&client_path, &ca_path) {
+            Ok(result) => {
+                println!("\n  [2/3] client.pem");
+                println!("        Subject: {}", result.subject);
+                println!("        Issuer:  {}", result.issuer);
+
+                if result.signed_by_ca {
+                    println!("        Chain:   ✓ Signed by CA");
+                } else {
+                    println!("        Chain:   ✗ NOT signed by CA");
+                    for err in &result.errors {
+                        println!("               Error: {}", err);
+                    }
+                }
+
+                if result.expired {
+                    println!("        Expiry:  ✗ Expired ({} days ago)", -result.days_remaining);
+                } else {
+                    println!("        Expiry:  ✓ Valid ({} days remaining)", result.days_remaining);
+                }
+
+                // Show SANs
+                match inspect::parse_cert(&client_path) {
+                    Ok(info) => {
+                        if !info.sans.is_empty() {
+                            println!("        SANs:");
+                            for san in &info.sans {
+                                println!("          - {}", san);
+                            }
+                        }
+                    }
+                    Err(_) => {}
+                }
+
+                // SAN check
+                match inspect::check_san_match(&client_path, hostname) {
+                    Ok(true) => println!("        SAN Check: ✓ Matches '{}'", hostname),
+                    Ok(false) => println!("        SAN Check: ✗ Does NOT match '{}'", hostname),
+                    Err(e) => println!("        SAN Check: ✗ Error: {}", e),
+                }
+                results.push(true);
+            }
+            Err(e) => {
+                println!("\n  [2/3] client.pem: ✗ Error: {}", e);
+                results.push(false);
+            }
+        }
+    }
+
+    // 3. client-key.pem
+    let client_key_path = cert_dir.join("client-key.pem");
+    if !client_key_path.exists() {
+        println!("\n  [3/3] client-key.pem: ✗ Not found");
+        results.push(false);
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            match fs::metadata(&client_key_path) {
+                Ok(meta) => {
+                    let mode = meta.permissions().mode() & 0o777;
+                    println!("\n  [3/3] client-key.pem");
+                    if mode == 0o400 {
+                        println!("        Permissions: ✓ 0400 (read-only)");
+                        results.push(true);
+                    } else {
+                        println!("        Permissions: ✗ {:04o} (expected 0400)", mode);
+                        results.push(false);
+                    }
+                }
+                Err(e) => {
+                    println!("\n  [3/3] client-key.pem: ✗ {}", e);
+                    results.push(false);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            println!("\n  [3/3] client-key.pem: ✓ Exists");
+            results.push(true);
+        }
+    }
+
+    results
 }
 
 /// Handle `gcob certs renew [--force]`
@@ -424,9 +1087,9 @@ pub fn dispatch(command: super::CertsCommand) {
             let cert_path = cert.unwrap_or_else(|| PathBuf::from("/etc/gcob/certs/server.pem"));
             handle_show(&cert_path);
         }
-        super::CertsCommand::Verify { hostname } => {
+        super::CertsCommand::Verify { hostname, target } => {
             let cert_dir = PathBuf::from("/etc/gcob/certs");
-            handle_verify(&cert_dir, hostname.as_deref());
+            handle_verify(&cert_dir, hostname.as_deref(), target);
         }
         super::CertsCommand::Renew { force } => {
             let cert_dir = PathBuf::from("/etc/gcob/certs");
