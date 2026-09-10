@@ -3,8 +3,47 @@ use std::path::{Path, PathBuf};
 
 use super::generate::CertError;
 
-/// Single canonical path for gcob certificates (production)
-pub const CERT_DIR: &str = "/etc/gcob/certs";
+/// Detect the admin user (UID >= 1000, not gcob) from /etc/passwd
+#[cfg(unix)]
+pub fn detect_admin_user() -> String {
+    unsafe {
+        libc::setpwent();
+        loop {
+            let pwd = libc::getpwent();
+            if pwd.is_null() {
+                break;
+            }
+            let entry = &*pwd;
+            let uid = entry.pw_uid;
+            let name = std::ffi::CStr::from_ptr(entry.pw_name)
+                .to_string_lossy()
+                .to_string();
+            let home = std::ffi::CStr::from_ptr(entry.pw_dir)
+                .to_string_lossy()
+                .to_string();
+
+            // Skip system users, gcob, and users without a real home
+            if uid >= 1000 && name != "gcob" && home.starts_with("/home/") {
+                libc::endpwent();
+                return name;
+            }
+        }
+        libc::endpwent();
+    }
+    "deb_cpim".to_string()
+}
+
+#[cfg(not(unix))]
+fn detect_admin_user() -> String {
+    "deb_cpim".to_string()
+}
+
+/// Resolve certificate directory: /home/<admin>/.certs
+/// Detects the admin user automatically (UID >= 1000, not gcob)
+pub fn default_cert_dir() -> PathBuf {
+    let admin = detect_admin_user();
+    PathBuf::from(format!("/home/{}/.certs", admin))
+}
 
 /// CLN source directory where the node stores its certificates
 const CLN_SOURCE_DIR_DEFAULT: &str = ".lightning/bitcoin";
@@ -39,7 +78,7 @@ impl ClientPaths {
     }
 
     pub fn default_path() -> Self {
-        Self::new(CERT_DIR)
+        Self::new(default_cert_dir().to_str().unwrap_or("~/.certs"))
     }
 }
 
@@ -167,9 +206,9 @@ pub fn setup_gcob_sudoers() -> Result<(), CertError> {
     Ok(())
 }
 
-/// Change ownership of a directory recursively using chown command
+/// Change ownership of a path recursively using chown command
 #[cfg(unix)]
-fn chown_recursive(path: &Path, user: &str) -> Result<(), CertError> {
+pub fn chown_recursive(path: &Path, user: &str) -> Result<(), CertError> {
     use std::process::Command;
 
     let output = Command::new("chown")
@@ -188,79 +227,54 @@ fn chown_recursive(path: &Path, user: &str) -> Result<(), CertError> {
     Ok(())
 }
 
-/// Ensure /etc/gcob/certs/ exists with correct ownership and permissions.
-/// If running as root: creates directly.
-/// If running as gcob: uses sudo (requires sudoers configured).
-pub fn ensure_cert_dir() -> Result<(), CertError> {
-    let cert_dir = Path::new(CERT_DIR);
-    let gcob_dir = Path::new("/etc/gcob");
+/// Setup ACLs so gcob can access admin's cert directory.
+/// Sets: home → gcob can traverse (x), .certs → gcob can read/write
+#[cfg(unix)]
+pub fn setup_gcob_acls() -> Result<(), CertError> {
+    use std::process::Command;
 
-    // Already exists - nothing to do
+    let admin = detect_admin_user();
+    let home_dir = format!("/home/{}", admin);
+    let cert_dir = default_cert_dir();
+
+    // ACL on home: gcob can traverse (x)
+    Command::new("setfacl")
+        .args(["-m", "u:gcob:x", &home_dir])
+        .output()
+        .map_err(|e| CertError::Io(std::io::Error::other(format!("setfacl failed: {}", e))))?;
+
+    // ACL on .certs: gcob can read/write
+    Command::new("setfacl")
+        .args(["-m", "u:gcob:rwx", cert_dir.to_str().unwrap()])
+        .output()
+        .map_err(|e| CertError::Io(std::io::Error::other(format!("setfacl failed: {}", e))))?;
+
+    Ok(())
+}
+
+/// Ensure ~/.certs exists with correct permissions (0700) and ownership (admin).
+/// Sets ACLs so gcob can access the directory.
+pub fn ensure_cert_dir() -> Result<(), CertError> {
+    let cert_dir = default_cert_dir();
+
+    // Already exists - apply ACLs and return
     if cert_dir.exists() {
+        #[cfg(unix)]
+        setup_gcob_acls()?;
         return Ok(());
     }
 
-    let uid = unsafe { libc::getuid() };
+    fs::create_dir_all(&cert_dir)?;
 
-    if uid == 0 {
-        // Running as root - create directly
-        fs::create_dir_all(cert_dir)?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(gcob_dir, fs::Permissions::from_mode(0o700))?;
-            fs::set_permissions(cert_dir, fs::Permissions::from_mode(0o700))?;
-        }
-
-        // Chown to gcob
-        chown_recursive(gcob_dir, "gcob")?;
-    } else {
-        // Running as gcob - use sudo
-        use std::process::Command;
-
-        // Create /etc/gcob directory
-        let output = Command::new("sudo")
-            .args(["mkdir", "-p", "/etc/gcob"])
-            .output()
-            .map_err(|e| CertError::Io(std::io::Error::other(format!("sudo mkdir failed: {}", e))))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(CertError::Io(std::io::Error::other(
-                format!("Failed to create /etc/gcob: {}", stderr.trim()),
-            )));
-        }
-
-        // Create /etc/gcob/certs directory
-        let output = Command::new("sudo")
-            .args(["mkdir", "-p", CERT_DIR])
-            .output()
-            .map_err(|e| CertError::Io(std::io::Error::other(format!("sudo mkdir failed: {}", e))))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(CertError::Io(std::io::Error::other(
-                format!("Failed to create {}: {}", CERT_DIR, stderr.trim()),
-            )));
-        }
-
-        // Set ownership (user only, group follows)
-        Command::new("sudo")
-            .args(["chown", "-R", "gcob", "/etc/gcob"])
-            .output()
-            .map_err(|e| CertError::Io(std::io::Error::other(format!("sudo chown failed: {}", e))))?;
-
-        // Set permissions
-        Command::new("sudo")
-            .args(["chmod", "700", "/etc/gcob"])
-            .output()
-            .map_err(|e| CertError::Io(std::io::Error::other(format!("sudo chmod failed: {}", e))))?;
-
-        Command::new("sudo")
-            .args(["chmod", "700", CERT_DIR])
-            .output()
-            .map_err(|e| CertError::Io(std::io::Error::other(format!("sudo chmod failed: {}", e))))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&cert_dir, fs::Permissions::from_mode(0o700))?;
+        // Ownership to admin
+        let admin = detect_admin_user();
+        chown_recursive(&cert_dir, &admin)?;
+        // ACLs for gcob access
+        setup_gcob_acls()?;
     }
 
     Ok(())

@@ -2,7 +2,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::certs::inspect;
-use crate::certs::paths::{check_gcob_access, is_server_env, ClnSourcePaths, ServerPaths};
+use crate::certs::paths::{check_gcob_access, default_cert_dir, is_server_env, ClnSourcePaths, ServerPaths};
 use super::VerifySubcommand;
 
 /// Handle `gcob certs` (no subcommand) — show usage help
@@ -19,7 +19,7 @@ pub fn handle_no_subcommand() {
     println!("    gcob certs list                  # Show all certificates");
     println!("    gcob certs verify                # Verify with localhost");
     println!("    gcob certs verify --hostname my-server  # Verify with custom hostname");
-    println!("    gcob certs show --cert /etc/gcob/certs/client.pem\n");
+    println!("    gcob certs show --cert /home/<admin>/.certs/client.pem\n");
 
     println!("SAN CHECK:");
     println!("    Verify that certificate SANs match the expected hostname.");
@@ -44,10 +44,10 @@ pub fn handle_list(server: bool) {
     }
 
     // Client Certificates — always shown
-    let client_dir = Path::new("/etc/gcob/certs");
+    let client_dir = default_cert_dir();
     print_cert_status(
         "Client Certificates:",
-        client_dir,
+        &client_dir,
         &["ca.pem", "client.pem", "client-key.pem"],
     );
 
@@ -1084,15 +1084,15 @@ pub fn dispatch(command: super::CertsCommand) {
     match command {
         super::CertsCommand::List { server } => handle_list(server),
         super::CertsCommand::Show { cert } => {
-            let cert_path = cert.unwrap_or_else(|| PathBuf::from("/etc/gcob/certs/server.pem"));
+            let cert_path = cert.unwrap_or_else(|| default_cert_dir().join("server.pem"));
             handle_show(&cert_path);
         }
         super::CertsCommand::Verify { hostname, target } => {
-            let cert_dir = PathBuf::from("/etc/gcob/certs");
+            let cert_dir = default_cert_dir();
             handle_verify(&cert_dir, hostname.as_deref(), target);
         }
         super::CertsCommand::Renew { force } => {
-            let cert_dir = PathBuf::from("/etc/gcob/certs");
+            let cert_dir = default_cert_dir();
             handle_renew(&cert_dir, force);
         }
     }

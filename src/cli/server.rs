@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 
 use crate::certs::generate::{self, CertError};
-use crate::certs::paths::{check_gcob_access, ensure_cert_dir, setup_gcob_sudoers, ClientPaths, ClnSourcePaths, ServerPaths};
+use crate::certs::paths::{check_gcob_access, chown_recursive, detect_admin_user, ensure_cert_dir, setup_gcob_acls, ClientPaths, ClnSourcePaths, ServerPaths};
 use crate::certs::detect;
 
 /// Handle `gcob init --client`
@@ -26,7 +26,7 @@ pub fn handle_init_client(
     let client_hostname = identity.hostname;
     let client_ip = identity.ip;
 
-    // Always use the canonical system path
+    // Always use the canonical path (~/.certs)
     let client_paths = ClientPaths::default_path();
 
     // Check if CSR already exists
@@ -67,35 +67,36 @@ pub fn handle_init_client(
         println!();
     }
 
-    // If running as root, setup sudoers first
-    let uid = unsafe { libc::getuid() };
-    if uid == 0 {
-        setup_gcob_sudoers()?;
-    }
-
     // Ensure certificate directory exists
     ensure_cert_dir()?;
 
-    // Step 1: Create output directory
-    println!("[1/5] Creating certificate directory...");
+    // Step 1: Ensure directory exists
+    println!("[1/4] Ensuring certificate directory...");
 
     // Step 2: Generate CSR
-    println!("[2/5] Generating CSR...");
+    println!("[2/4] Generating CSR...");
     generate::generate_csr(&client_hostname, client_ip.as_deref(), &client_paths.cert_dir)?;
-    println!("[3/5] CSR generated successfully");
+    println!("[3/4] CSR generated successfully");
 
-    // Step 3: Set permissions (silent)
+    // Step 3: Set permissions, ownership and ACLs (silent)
     #[cfg(unix)]
     {
-        let _ = generate::set_permissions(&client_paths.cert_dir, 0o700);
-        let _ = generate::set_permissions(&client_paths.client_key_file, 0o400);
-        let _ = generate::set_permissions(&client_paths.cert_dir.join("client.csr"), 0o444);
-    }
-
-    // Step 4: Chown to gcob user (silent)
-    #[cfg(unix)]
-    {
-        let _ = chown_recursive(&client_paths.cert_dir, "gcob");
+        use std::os::unix::fs::PermissionsExt;
+        // Key: only owner can read
+        let _ = std::fs::set_permissions(
+            &client_paths.client_key_file,
+            std::fs::Permissions::from_mode(0o400),
+        );
+        // CSR: readable by all
+        let _ = std::fs::set_permissions(
+            &client_paths.cert_dir.join("client.csr"),
+            std::fs::Permissions::from_mode(0o444),
+        );
+        // Ownership to admin (not root)
+        let admin = detect_admin_user();
+        let _ = chown_recursive(&client_paths.cert_dir, &admin);
+        // ACLs for gcob access
+        let _ = setup_gcob_acls();
     }
 
     println!();
@@ -114,27 +115,6 @@ pub fn handle_init_client(
     println!();
     println!("  3. Server will return: ca.pem + client.pem");
     println!("     Place them in: {}/", client_paths.cert_dir.display());
-
-    Ok(())
-}
-
-/// Change ownership of a directory recursively using chown command
-#[cfg(unix)]
-fn chown_recursive(path: &Path, user: &str) -> Result<(), CertError> {
-    use std::process::Command;
-
-    let output = Command::new("chown")
-        .args(["-R", &format!("{}:{}", user, user)])
-        .arg(path)
-        .output()
-        .map_err(|e| CertError::Io(std::io::Error::other(format!("Failed to run chown: {}", e))))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(CertError::Io(std::io::Error::other(
-            format!("chown failed: {}", stderr.trim()),
-        )));
-    }
 
     Ok(())
 }
@@ -190,10 +170,10 @@ pub fn handle_init_server(
     generate::copy_file(&cln_source.ca_key_file, &server_paths.ca_key_file)?;
     println!("  [✓] ca.pem copied");
 
-    // Step 3b: Copy CA to /etc/gcob/certs/ for API verification
+    // Step 3b: Copy CA to ~/.certs/ for API verification
     generate::copy_file(&cln_source.ca_file, &client_paths.ca_file)?;
     generate::copy_file(&cln_source.ca_key_file, &client_paths.ca_key_file)?;
-    println!("  [✓] ca.pem + ca-key.pem copied to /etc/gcob/certs/");
+    println!("  [✓] ca.pem + ca-key.pem copied to {}/", client_paths.cert_dir.display());
 
     // Step 4: Generate HAProxy server cert (mTLS 2 server side)
     let temp_dir = Path::new("/tmp/gcob_certs");

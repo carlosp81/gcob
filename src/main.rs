@@ -70,10 +70,11 @@ async fn main() {
             hostname,
             output,
         } => {
-            let output_path = output
-                .as_deref()
-                .unwrap_or_else(|| std::path::Path::new("/etc/gcob/certs"));
-            if let Err(e) = cli::certs::handle_sign(&csr, &hostname, output_path) {
+            let output_path = match output {
+                Some(p) => p,
+                None => certs::paths::default_cert_dir(),
+            };
+            if let Err(e) = cli::certs::handle_sign(&csr, &hostname, &output_path) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
