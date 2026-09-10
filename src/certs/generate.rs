@@ -210,47 +210,6 @@ pub fn sign_csr<S: SigningKey>(
     Ok(())
 }
 
-/// Generate a server certificate for Bakog API (mTLS 1 server side)
-pub fn generate_api_server_cert<S: SigningKey>(
-    issuer: &Issuer<'_, S>,
-    hostname: &str,
-    ip: &str,
-    output_dir: &Path,
-) -> Result<(), CertError> {
-    let server_key = KeyPair::generate().map_err(CertError::Rcgen)?;
-
-    let ip_addr: std::net::IpAddr = ip
-        .parse()
-        .map_err(|_| CertError::InvalidIp(ip.to_string()))?;
-
-    let san_names = vec![hostname.to_string(), "localhost".to_string()];
-
-    let mut params = CertificateParams::new(san_names).map_err(CertError::Rcgen)?;
-    params.distinguished_name = DistinguishedName::new();
-    params
-        .distinguished_name
-        .push(DnType::CommonName, hostname);
-    params
-        .extended_key_usages
-        .push(ExtendedKeyUsagePurpose::ServerAuth);
-    params.subject_alt_names.push(SanType::IpAddress(ip_addr));
-
-    let cert = params
-        .signed_by(&server_key, issuer)
-        .map_err(CertError::Rcgen)?;
-
-    // Write server certificate
-    fs::write(output_dir.join("server-api.pem"), cert.pem())?;
-
-    // Write server key
-    fs::write(
-        output_dir.join("server-api-key.pem"),
-        server_key.serialize_pem(),
-    )?;
-
-    Ok(())
-}
-
 /// Copy a file, creating parent directories if needed
 pub fn copy_file(src: &Path, dst: &Path) -> Result<(), CertError> {
     if let Some(parent) = dst.parent() {

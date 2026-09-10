@@ -169,7 +169,6 @@ pub fn handle_init_server(
     generate::copy_file(&cln_source.ca_file, &server_paths.ca_file)?;
     generate::copy_file(&cln_source.ca_key_file, &server_paths.ca_key_file)?;
     generate::copy_file(&cln_source.ca_file, &client_paths.ca_file)?;
-    generate::copy_file(&cln_source.ca_key_file, &client_paths.ca_key_file)?;
     println!("  [✓] ca.pem copied to both directories");
 
     // Step 4: Generate HAProxy server + client certs (mTLS 2 + 3)
@@ -216,7 +215,6 @@ pub fn handle_init_server(
         generate::set_permissions(&server_paths.client_concat_file, 0o600)?;
         generate::set_permissions(&client_paths.cert_dir, 0o700)?;
         let _ = generate::set_permissions(&client_paths.ca_file, 0o444);
-        let _ = generate::set_permissions(&client_paths.ca_key_file, 0o400);
         let _ = generate::set_permissions(&client_paths.cert_dir.join("server.pem"), 0o444);
         let _ = generate::set_permissions(&client_paths.cert_dir.join("server-key.pem"), 0o400);
     }

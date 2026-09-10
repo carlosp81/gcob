@@ -52,13 +52,7 @@ const CLN_SOURCE_DIR_DEFAULT: &str = ".lightning/bitcoin";
 pub struct ClientPaths {
     pub cert_dir: PathBuf,
     pub ca_file: PathBuf,
-    pub ca_key_file: PathBuf,
-    pub client_file: PathBuf,
     pub client_key_file: PathBuf,
-    pub server_api_file: PathBuf,
-    pub server_api_key_file: PathBuf,
-    pub client_api_file: PathBuf,
-    pub client_api_key_file: PathBuf,
 }
 
 impl ClientPaths {
@@ -66,13 +60,7 @@ impl ClientPaths {
         let dir = PathBuf::from(cert_dir);
         Self {
             ca_file: dir.join("ca.pem"),
-            ca_key_file: dir.join("ca-key.pem"),
-            client_file: dir.join("client.pem"),
             client_key_file: dir.join("client-key.pem"),
-            server_api_file: dir.join("server-api.pem"),
-            server_api_key_file: dir.join("server-api-key.pem"),
-            client_api_file: dir.join("client-api.pem"),
-            client_api_key_file: dir.join("client-api-key.pem"),
             cert_dir: dir,
         }
     }
@@ -159,50 +147,6 @@ pub fn check_gcob_access() -> Result<(), CertError> {
     }
 
     #[cfg(not(unix))]
-    Ok(())
-}
-
-/// Minimal sudoers content for gcob certificate management
-const GCOB_SUDOERS_CONTENT: &str = r#"# Minimal sudoers for gcob certificate management
-# Created by gcob init --client
-
-# Allow gcob to create and manage /etc/gcob/certs/
-gcob ALL=(root) NOPASSWD: /usr/bin/mkdir -p /etc/gcob
-gcob ALL=(root) NOPASSWD: /usr/bin/mkdir -p /etc/gcob/certs
-gcob ALL=(root) NOPASSWD: /usr/bin/chown -R gcob /etc/gcob
-gcob ALL=(root) NOPASSWD: /usr/bin/chmod 700 /etc/gcob
-gcob ALL=(root) NOPASSWD: /usr/bin/chmod 700 /etc/gcob/certs
-gcob ALL=(root) NOPASSWD: /usr/bin/cat /etc/gcob/certs/client.csr
-gcob ALL=(root) NOPASSWD: /usr/bin/cat /etc/gcob/certs/ca.pem
-"#;
-
-/// Write /etc/sudoers.d/gcob with minimal permissions for certificate management.
-/// Must be executed as root (uid=0).
-pub fn setup_gcob_sudoers() -> Result<(), CertError> {
-    let uid = unsafe { libc::getuid() };
-    if uid != 0 {
-        return Err(CertError::Io(std::io::Error::other(
-            "setup_gcob_sudoers must be run as root",
-        )));
-    }
-
-    let sudoers_path = "/etc/sudoers.d/gcob";
-
-    // Skip if already configured
-    if Path::new(sudoers_path).exists() {
-        return Ok(());
-    }
-
-    // Write sudoers file
-    fs::write(sudoers_path, GCOB_SUDOERS_CONTENT)?;
-
-    // Set permissions (must be 0440 for sudoers)
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(sudoers_path, fs::Permissions::from_mode(0o440))?;
-    }
-
     Ok(())
 }
 

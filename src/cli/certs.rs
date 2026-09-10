@@ -197,19 +197,19 @@ pub fn handle_show(cert_path: &Path) {
 }
 
 /// Verify API certificates section (server only)
-fn verify_api_section(cert_dir: &Path, hostname: &str) -> Vec<bool> {
+fn verify_api_section(cert_dir: &Path, _hostname: &str) -> Vec<bool> {
     println!("── API Certificates ({}) ──\n", cert_dir.display());
     let mut results = Vec::new();
 
-    // 1. ca.pem
+    // ca.pem
     let ca_path = cert_dir.join("ca.pem");
     if !ca_path.exists() {
-        println!("  [1/6] ca.pem: ✗ Not found");
+        println!("  ca.pem: ✗ Not found");
         results.push(false);
     } else {
         match inspect::parse_cert(&ca_path) {
             Ok(info) => {
-                println!("  [1/6] ca.pem");
+                println!("  ca.pem");
                 println!("        Subject: {}", info.subject);
                 println!("        Is CA:   {}", info.is_ca);
                 if info.is_ca {
@@ -220,211 +220,9 @@ fn verify_api_section(cert_dir: &Path, hostname: &str) -> Vec<bool> {
                 results.push(true);
             }
             Err(e) => {
-                println!("  [1/6] ca.pem: ✗ Parse error: {}", e);
+                println!("  ca.pem: ✗ Parse error: {}", e);
                 results.push(false);
             }
-        }
-    }
-
-    // 2. ca-key.pem
-    let ca_key_path = cert_dir.join("ca-key.pem");
-    if !ca_key_path.exists() {
-        println!("\n  [2/6] ca-key.pem: ✗ Not found");
-        results.push(false);
-    } else {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            match fs::metadata(&ca_key_path) {
-                Ok(meta) => {
-                    let mode = meta.permissions().mode() & 0o777;
-                    println!("\n  [2/6] ca-key.pem");
-                    if mode == 0o400 {
-                        println!("        Permissions: ✓ 0400 (read-only)");
-                        results.push(true);
-                    } else {
-                        println!("        Permissions: ✗ {:04o} (expected 0400)", mode);
-                        results.push(false);
-                    }
-                }
-                Err(e) => {
-                    println!("\n  [2/6] ca-key.pem: ✗ {}", e);
-                    results.push(false);
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            println!("\n  [2/6] ca-key.pem: ✓ Exists");
-            results.push(true);
-        }
-    }
-
-    // 3. server-api.pem
-    let server_api_path = cert_dir.join("server-api.pem");
-    if !server_api_path.exists() {
-        println!("\n  [3/6] server-api.pem: ✗ Not found");
-        results.push(false);
-    } else {
-        match inspect::verify_signed_by(&server_api_path, &ca_path) {
-            Ok(result) => {
-                println!("\n  [3/6] server-api.pem");
-                println!("        Subject: {}", result.subject);
-                println!("        Issuer:  {}", result.issuer);
-
-                if result.signed_by_ca {
-                    println!("        Chain:   ✓ Signed by CA");
-                } else {
-                    println!("        Chain:   ✗ NOT signed by CA");
-                    for err in &result.errors {
-                        println!("               Error: {}", err);
-                    }
-                }
-
-                if result.expired {
-                    println!("        Expiry:  ✗ Expired ({} days ago)", -result.days_remaining);
-                } else {
-                    println!("        Expiry:  ✓ Valid ({} days remaining)", result.days_remaining);
-                }
-
-                // Show SANs
-                match inspect::parse_cert(&server_api_path) {
-                    Ok(info) => {
-                        if !info.sans.is_empty() {
-                            println!("        SANs:");
-                            for san in &info.sans {
-                                println!("          - {}", san);
-                            }
-                        }
-                    }
-                    Err(_) => {}
-                }
-
-                // SAN check
-                match inspect::check_san_match(&server_api_path, hostname) {
-                    Ok(true) => println!("        SAN Check: ✓ Matches '{}'", hostname),
-                    Ok(false) => println!("        SAN Check: ✗ Does NOT match '{}'", hostname),
-                    Err(e) => println!("        SAN Check: ✗ Error: {}", e),
-                }
-                results.push(true);
-            }
-            Err(e) => {
-                println!("\n  [3/6] server-api.pem: ✗ Error: {}", e);
-                results.push(false);
-            }
-        }
-    }
-
-    // 4. server-api-key.pem
-    let server_api_key_path = cert_dir.join("server-api-key.pem");
-    if !server_api_key_path.exists() {
-        println!("\n  [4/6] server-api-key.pem: ✗ Not found");
-        results.push(false);
-    } else {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            match fs::metadata(&server_api_key_path) {
-                Ok(meta) => {
-                    let mode = meta.permissions().mode() & 0o777;
-                    println!("\n  [4/6] server-api-key.pem");
-                    if mode == 0o400 {
-                        println!("        Permissions: ✓ 0400 (read-only)");
-                        results.push(true);
-                    } else {
-                        println!("        Permissions: ✗ {:04o} (expected 0400)", mode);
-                        results.push(false);
-                    }
-                }
-                Err(e) => {
-                    println!("\n  [4/6] server-api-key.pem: ✗ {}", e);
-                    results.push(false);
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            println!("\n  [4/6] server-api-key.pem: ✓ Exists");
-            results.push(true);
-        }
-    }
-
-    // 5. client-api.pem
-    let client_api_path = cert_dir.join("client-api.pem");
-    if !client_api_path.exists() {
-        println!("\n  [5/6] client-api.pem: ✗ Not found");
-        results.push(false);
-    } else {
-        match inspect::verify_signed_by(&client_api_path, &ca_path) {
-            Ok(result) => {
-                println!("\n  [5/6] client-api.pem");
-                println!("        Subject: {}", result.subject);
-                println!("        Issuer:  {}", result.issuer);
-
-                if result.signed_by_ca {
-                    println!("        Chain:   ✓ Signed by CA");
-                } else {
-                    println!("        Chain:   ✗ NOT signed by CA");
-                }
-
-                if result.expired {
-                    println!("        Expiry:  ✗ Expired ({} days ago)", -result.days_remaining);
-                } else {
-                    println!("        Expiry:  ✓ Valid ({} days remaining)", result.days_remaining);
-                }
-
-                // Show SANs
-                match inspect::parse_cert(&client_api_path) {
-                    Ok(info) => {
-                        if !info.sans.is_empty() {
-                            println!("        SANs:");
-                            for san in &info.sans {
-                                println!("          - {}", san);
-                            }
-                        }
-                    }
-                    Err(_) => {}
-                }
-                results.push(true);
-            }
-            Err(e) => {
-                println!("\n  [5/6] client-api.pem: ✗ Error: {}", e);
-                results.push(false);
-            }
-        }
-    }
-
-    // 6. client-api-key.pem
-    let client_api_key_path = cert_dir.join("client-api-key.pem");
-    if !client_api_key_path.exists() {
-        println!("\n  [6/6] client-api-key.pem: ✗ Not found");
-        results.push(false);
-    } else {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            match fs::metadata(&client_api_key_path) {
-                Ok(meta) => {
-                    let mode = meta.permissions().mode() & 0o777;
-                    println!("\n  [6/6] client-api-key.pem");
-                    if mode == 0o400 {
-                        println!("        Permissions: ✓ 0400 (read-only)");
-                        results.push(true);
-                    } else {
-                        println!("        Permissions: ✗ {:04o} (expected 0400)", mode);
-                        results.push(false);
-                    }
-                }
-                Err(e) => {
-                    println!("\n  [6/6] client-api-key.pem: ✗ {}", e);
-                    results.push(false);
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            println!("\n  [6/6] client-api-key.pem: ✓ Exists");
-            results.push(true);
         }
     }
 
