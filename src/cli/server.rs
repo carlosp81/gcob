@@ -152,42 +152,34 @@ pub fn handle_init_server(
     println!();
 
     // Step 1: Read CA from CLN source
-    println!("[1/7] Reading CA from CLN source...");
+    println!("[1/5] Reading CA from CLN source...");
     let issuer = generate::read_cln_ca(&cln_source)?;
     println!("  [✓] CA loaded");
 
     // Step 2: Create directories
-    println!("[2/7] Creating directories...");
+    println!("[2/5] Creating directories...");
     fs::create_dir_all(&server_paths.haproxy_cert_dir)?;
     fs::create_dir_all(&server_paths.haproxy_ca_dir)?;
     fs::create_dir_all(&client_paths.cert_dir)?;
     println!("  [✓] {}", server_paths.haproxy_cert_dir.display());
     println!("  [✓] {}", client_paths.cert_dir.display());
 
-    // Step 3: Copy CA to HAProxy ca-certs
-    println!("[3/7] Copying CA to HAProxy ca-certs...");
+    // Step 3: Copy CA to HAProxy ca-certs + ~/.certs/
+    println!("[3/5] Copying CA...");
     generate::copy_file(&cln_source.ca_file, &server_paths.ca_file)?;
     generate::copy_file(&cln_source.ca_key_file, &server_paths.ca_key_file)?;
-    println!("  [✓] ca.pem copied");
-
-    // Step 3b: Copy CA to ~/.certs/ for API verification
     generate::copy_file(&cln_source.ca_file, &client_paths.ca_file)?;
     generate::copy_file(&cln_source.ca_key_file, &client_paths.ca_key_file)?;
-    println!("  [✓] ca.pem + ca-key.pem copied to {}/", client_paths.cert_dir.display());
+    println!("  [✓] ca.pem copied to both directories");
 
-    // Step 4: Generate HAProxy server cert (mTLS 2 server side)
+    // Step 4: Generate HAProxy server + client certs (mTLS 2 + 3)
     let temp_dir = Path::new("/tmp/gcob_certs");
     fs::create_dir_all(temp_dir)?;
-    println!("[4/7] Generating HAProxy server certificate...");
+    println!("[4/5] Generating HAProxy certificates...");
     generate::generate_server_cert(&issuer, &hostname, &ip, temp_dir)?;
-    println!("  [✓] server-haproxy.pem generated");
-
-    // Step 5: Generate HAProxy client cert for CLN (mTLS 3 client side)
-    println!("[5/7] Generating HAProxy client certificate (→ CLN)...");
     generate::generate_client_cert(&issuer, &hostname, temp_dir)?;
-    println!("  [✓] client-proxy.pem generated");
 
-    // Create HAProxy bundles
+    // HAProxy bundles (cert+key concatenated)
     generate::concat_cert_key(
         &temp_dir.join("server.pem"),
         &temp_dir.join("server-key.pem"),
@@ -200,31 +192,20 @@ pub fn handle_init_server(
     )?;
     println!("  [✓] HAProxy bundles created");
 
-    // Step 6: Generate Bakog API server cert (mTLS 1 server side)
-    println!("[6/7] Generating Bakog API server certificate...");
-    generate::generate_api_server_cert(&issuer, &hostname, &ip, &client_paths.cert_dir)?;
-    println!("  [✓] server-api.pem generated");
+    // Copy server cert to ~/.certs/ for API server (same host, shared cert)
+    generate::copy_file(
+        &temp_dir.join("server.pem"),
+        &client_paths.cert_dir.join("server.pem"),
+    )?;
+    generate::copy_file(
+        &temp_dir.join("server-key.pem"),
+        &client_paths.cert_dir.join("server-key.pem"),
+    )?;
+    println!("  [✓] Server cert copied to {}/", client_paths.cert_dir.display());
 
-    // Step 7: Generate Bakog API client cert for HAProxy (mTLS 2 client side)
-    println!("[7/7] Generating Bakog API client certificate (→ HAProxy)...");
-    generate::generate_client_cert(&issuer, &hostname, &client_paths.cert_dir)?;
-    // Rename to avoid confusion with external client
-    let api_client = client_paths.cert_dir.join("client.pem");
-    let api_client_renamed = client_paths.cert_dir.join("client-api.pem");
-    if api_client.exists() {
-        fs::rename(&api_client, &api_client_renamed)?;
-    }
-    let api_client_key = client_paths.cert_dir.join("client-key.pem");
-    let api_client_key_renamed = client_paths.cert_dir.join("client-api-key.pem");
-    if api_client_key.exists() {
-        fs::rename(&api_client_key, &api_client_key_renamed)?;
-    }
-    println!("  [✓] client-api.pem generated");
-
-    // Clean up temp files
+    // Step 5: Set permissions
+    println!("[5/5] Setting permissions...");
     let _ = fs::remove_dir_all(temp_dir);
-
-    // Set permissions
     #[cfg(unix)]
     {
         generate::set_permissions(&server_paths.haproxy_cert_dir, 0o700)?;
@@ -236,11 +217,10 @@ pub fn handle_init_server(
         generate::set_permissions(&client_paths.cert_dir, 0o700)?;
         let _ = generate::set_permissions(&client_paths.ca_file, 0o444);
         let _ = generate::set_permissions(&client_paths.ca_key_file, 0o400);
-        let _ = generate::set_permissions(&client_paths.cert_dir.join("server-api.pem"), 0o444);
-        let _ = generate::set_permissions(&client_paths.cert_dir.join("server-api-key.pem"), 0o400);
-        let _ = generate::set_permissions(&client_paths.cert_dir.join("client-api.pem"), 0o444);
-        let _ = generate::set_permissions(&client_paths.cert_dir.join("client-api-key.pem"), 0o400);
+        let _ = generate::set_permissions(&client_paths.cert_dir.join("server.pem"), 0o444);
+        let _ = generate::set_permissions(&client_paths.cert_dir.join("server-key.pem"), 0o400);
     }
+    println!("  [✓] Done");
 
     println!();
     println!("=== Server certificates generated ===");
@@ -249,9 +229,8 @@ pub fn handle_init_server(
     println!("  {}", server_paths.server_concat_file.display());
     println!("  {}", server_paths.client_concat_file.display());
     println!();
-    println!("Bakog API (mTLS 1 + 2):");
-    println!("  {}/server-api.pem", client_paths.cert_dir.display());
-    println!("  {}/client-api.pem", client_paths.cert_dir.display());
+    println!("Bakog API (server):");
+    println!("  {}/server.pem", client_paths.cert_dir.display());
     println!();
     println!("To sign external client CSR:");
     println!("  gcob sign --csr /tmp/client.csr --hostname <CLIENT_IP>");
