@@ -14,6 +14,13 @@ service NodeServices {
     // Pago via BOLT11/BOLT12
     rpc Xpay(cln.XpayRequest) returns (cln.XpayResponse);
 
+    // --- Unary + Watch integrado ---
+
+    // Crear factura + stream de eventos filtrado por label
+    rpc InvoiceStream(cln.InvoiceRequest) returns (stream Event);
+    // Pago BOLT11/BOLT12 + stream de eventos filtrado por payment_hash
+    rpc XpayStreamWatch(cln.XpayRequest) returns (stream Event);
+
     // --- Streaming RPCs ---
 
     // Stream de eventos de pago (succeeded, failed, part_start, part_end)

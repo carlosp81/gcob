@@ -16,7 +16,7 @@ pub struct ApiService {
     pub event_router: Arc<EventRouter>,
 }
 
-pub(crate) async fn run() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let cert_config = ClnConfig::from_env()?;
     cert_config.validate_all()?;
     let client = ClnClient::connect(&cert_config).await?;

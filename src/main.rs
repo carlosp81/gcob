@@ -1,12 +1,9 @@
 use clap::Parser;
 
-mod certs;
 mod cli;
-mod cln;
-mod domain;
-mod events;
-mod grpc;
-mod infra;
+
+// Re-export library modules so cli/* can use crate::certs, crate::cln, etc.
+pub use gcob::{certs, cln, domain, events, grpc, infra};
 
 use cli::{Cli, Commands};
 
@@ -72,7 +69,7 @@ async fn main() {
         } => {
             let output_path = match output {
                 Some(p) => p,
-                None => certs::paths::default_cert_dir(),
+                None => gcob::certs::paths::default_cert_dir(),
             };
             if let Err(e) = cli::certs::handle_sign(&csr, &hostname, &output_path) {
                 eprintln!("Error: {}", e);

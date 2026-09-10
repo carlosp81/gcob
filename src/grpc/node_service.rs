@@ -95,6 +95,238 @@ impl NodeServices for ApiService {
         xpay::xpay(c, request).await
     }
 
+    // --- Unary + Watch integrado ---
+
+    type InvoiceStreamStream = ReceiverStream<Result<cln_api::Event, Status>>;
+
+    async fn invoice_stream(
+        &self,
+        request: Request<cln_api::InvoiceRequest>,
+    ) -> Result<Response<Self::InvoiceStreamStream>, Status> {
+        // 1. Auth + Rate limit (mismo que invoice())
+        let rune = extract_rune_from_request(&request).ok_or_else(|| {
+            Status::unauthenticated(format!(
+                "Missing or empty Rune header '{}'. Provide a valid Rune for authentication.",
+                RUNE_HEADER
+            ))
+        })?;
+        validate_rune(&self.client, &rune, "invoice").await?;
+        tracing::info!("Rune validated - allowing invoice_stream request through");
+
+        let client_id = extract_client_id(&request).ok_or_else(|| {
+            Status::invalid_argument(format!("Missing or invalid '{}' header", CLIENT_ID_HEADER))
+        })?;
+        let allowed = match &self.redis_cm {
+            Some(cm) => check_rate_limit(cm, &client_id)
+                .await
+                .map_err(|_| Status::unavailable("Rate limiter unavailable"))?,
+            None => {
+                tracing::warn!("Valkey not connected - rate limiting skipped");
+                true
+            }
+        };
+        if !allowed {
+            return Err(Status::resource_exhausted(
+                "Rate limit exceeded: maximum 3 invoices per hour",
+            ));
+        }
+
+        // 2. Llamar CLN invoice()
+        let req_label = request.get_ref().label.clone();
+        let req_amount = request
+            .get_ref()
+            .amount_msat
+            .as_ref()
+            .and_then(|a| match &a.value {
+                Some(crate::cln::cln_api::amount_or_any::Value::Amount(amt)) => Some(amt.msat),
+                _ => None,
+            });
+        let req_description = request.get_ref().description.clone();
+        let cln_response = create::create_invoice(&self.client, request).await?;
+        let cln_res = cln_response.into_inner();
+
+        // 3. Construir InvoiceCreated desde la respuesta CLN
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let internal_event = crate::events::types::Event::Invoice(
+            crate::events::types::InvoiceEvent::Created {
+                event_id: format!("cln-inv-stream-{}", req_label),
+                timestamp: now,
+                label: req_label.clone(),
+                amount_msat: req_amount,
+                description: req_description.clone(),
+                bolt11: cln_res.bolt11.clone(),
+            },
+        );
+        let proto_created = crate::domain::invoice::watch::to_proto_event(&internal_event)
+            .unwrap_or_else(|| {
+                tracing::warn!("Failed to convert InvoiceCreated to proto");
+                cln_api::Event {
+                    event: Some(cln_api::event::Event::InvoiceCreated(cln_api::InvoiceCreated {
+                        event_id: format!("cln-inv-stream-{}", req_label),
+                        timestamp: now,
+                        label: req_label.clone(),
+                        amount_msat: req_amount,
+                        description: req_description,
+                        bolt11: cln_res.bolt11.clone(),
+                        recommendation: String::new(),
+                    })),
+                }
+            });
+
+        // 4. Suscribir a "invoice" y crear canales
+        let (internal_tx, mut internal_rx) =
+            tokio::sync::mpsc::channel::<crate::events::types::Event>(64);
+        let (proto_tx, proto_rx) =
+            tokio::sync::mpsc::channel::<Result<cln_api::Event, Status>>(64);
+
+        let router = self.event_router.clone();
+        let subscriber_id = next_subscriber_id();
+        router
+            .subscribe("invoice", subscriber_id.clone(), internal_tx)
+            .await;
+
+        // 5. Spawn task con filtro por label
+        let router_clone = router.clone();
+        let sub_id = subscriber_id.clone();
+        let target_label = req_label.clone();
+        tokio::spawn(async move {
+            tracing::info!(
+                subscriber_id = %sub_id,
+                label = %target_label,
+                "invoice_stream subscribed, sending InvoiceCreated"
+            );
+
+            // Enviar InvoiceCreated de inmediato
+            if proto_tx.send(Ok(proto_created)).await.is_err() {
+                tracing::warn!(subscriber_id = %sub_id, "invoice_stream client disconnected (created)");
+                router_clone.unsubscribe("invoice", &sub_id).await;
+                return;
+            }
+
+            // Filtrar InvoicePaid por label
+            while let Some(event) = internal_rx.recv().await {
+                if let crate::events::types::Event::Invoice(
+                    crate::events::types::InvoiceEvent::Paid { label, .. },
+                ) = &event
+                {
+                    if label == &target_label {
+                        tracing::info!(
+                            subscriber_id = %sub_id,
+                            label = %label,
+                            "invoice_stream: InvoicePaid received, closing stream"
+                        );
+                        if let Some(proto_event) =
+                            crate::domain::invoice::watch::to_proto_event(&event)
+                        {
+                            let _ = proto_tx.send(Ok(proto_event)).await;
+                        }
+                        break;
+                    }
+                }
+            }
+
+            router_clone.unsubscribe("invoice", &sub_id).await;
+            tracing::info!(subscriber_id = %sub_id, "invoice_stream unsubscribed");
+        });
+
+        Ok(Response::new(ReceiverStream::new(proto_rx)))
+    }
+
+    type XpayStreamWatchStream = ReceiverStream<Result<cln_api::Event, Status>>;
+
+    async fn xpay_stream_watch(
+        &self,
+        request: Request<cln_api::XpayRequest>,
+    ) -> Result<Response<Self::XpayStreamWatchStream>, Status> {
+        // 1. Auth (mismo que xpay())
+        let rune = extract_rune_from_request(&request).ok_or_else(|| {
+            Status::unauthenticated(format!(
+                "Missing or empty Rune header '{}'. Provide a valid Rune for authentication.",
+                RUNE_HEADER
+            ))
+        })?;
+        validate_rune(&self.client, &rune, "xpay").await?;
+        tracing::info!("Rune validated - allowing xpay_stream_watch request through");
+
+        // 2. Llamar CLN xpay()
+        let cln_response = xpay::xpay(&self.client, request).await?;
+        let cln_res = cln_response.into_inner();
+
+        // 3. Calcular payment_hash = SHA256(preimage)
+        use sha2::{Digest, Sha256};
+        let preimage_bytes = hex::decode(&cln_res.payment_preimage).map_err(|e| {
+            Status::internal(format!("Failed to decode payment_preimage: {}", e))
+        })?;
+        let payment_hash = {
+            let mut hasher = Sha256::new();
+            hasher.update(&preimage_bytes);
+            hex::encode(hasher.finalize())
+        };
+
+        // 4. Suscribir a "payment" y crear canales
+        let (internal_tx, mut internal_rx) =
+            tokio::sync::mpsc::channel::<crate::events::types::Event>(64);
+        let (proto_tx, proto_rx) =
+            tokio::sync::mpsc::channel::<Result<cln_api::Event, Status>>(64);
+
+        let router = self.event_router.clone();
+        let subscriber_id = next_subscriber_id();
+        router
+            .subscribe("payment", subscriber_id.clone(), internal_tx)
+            .await;
+
+        // 5. Spawn task con filtro por payment_hash
+        let router_clone = router.clone();
+        let sub_id = subscriber_id.clone();
+        let target_hash = payment_hash.clone();
+        tokio::spawn(async move {
+            tracing::info!(
+                subscriber_id = %sub_id,
+                payment_hash = %target_hash,
+                "xpay_stream_watch subscribed, waiting for payment event"
+            );
+
+            // Filtrar PaymentSucceeded o PaymentFailed por payment_hash
+            while let Some(event) = internal_rx.recv().await {
+                let matches = match &event {
+                    crate::events::types::Event::Payment(
+                        crate::events::types::PaymentEvent::Succeeded {
+                            payment_hash, ..
+                        },
+                    ) => payment_hash == &target_hash,
+                    crate::events::types::Event::Payment(
+                        crate::events::types::PaymentEvent::Failed {
+                            payment_hash, ..
+                        },
+                    ) => payment_hash == &target_hash,
+                    _ => false,
+                };
+
+                if matches {
+                    tracing::info!(
+                        subscriber_id = %sub_id,
+                        payment_hash = %target_hash,
+                        "xpay_stream_watch: matching payment event received, closing stream"
+                    );
+                    if let Some(proto_event) =
+                        crate::domain::invoice::pay_stream::to_proto_event(&event)
+                    {
+                        let _ = proto_tx.send(Ok(proto_event)).await;
+                    }
+                    break;
+                }
+            }
+
+            router_clone.unsubscribe("payment", &sub_id).await;
+            tracing::info!(subscriber_id = %sub_id, "xpay_stream_watch unsubscribed");
+        });
+
+        Ok(Response::new(ReceiverStream::new(proto_rx)))
+    }
+
     // --- Streaming RPCs ---
 
     type XpayStreamStream = ReceiverStream<Result<cln_api::Event, Status>>;
