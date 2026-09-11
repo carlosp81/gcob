@@ -336,8 +336,17 @@ impl NodeServices for ApiService {
 
     async fn xpay_stream(
         &self,
-        _request: Request<()>,
+        request: Request<()>,
     ) -> Result<Response<Self::XpayStreamStream>, Status> {
+        let rune = extract_rune_from_request(&request).ok_or_else(|| {
+            Status::unauthenticated(format!(
+                "Missing or empty Rune header '{}'. Provide a valid Rune for authentication.",
+                RUNE_HEADER
+            ))
+        })?;
+        validate_rune(&self.client, &rune, "xpay_stream").await?;
+        tracing::info!("Rune validated - allowing xpay_stream request through");
+
         let (internal_tx, mut internal_rx) =
             tokio::sync::mpsc::channel::<crate::events::types::Event>(64);
         let (proto_tx, proto_rx) = tokio::sync::mpsc::channel::<Result<cln_api::Event, Status>>(64);
@@ -375,8 +384,17 @@ impl NodeServices for ApiService {
 
     async fn invoice_watch(
         &self,
-        _request: Request<()>,
+        request: Request<()>,
     ) -> Result<Response<Self::InvoiceWatchStream>, Status> {
+        let rune = extract_rune_from_request(&request).ok_or_else(|| {
+            Status::unauthenticated(format!(
+                "Missing or empty Rune header '{}'. Provide a valid Rune for authentication.",
+                RUNE_HEADER
+            ))
+        })?;
+        validate_rune(&self.client, &rune, "invoice_watch").await?;
+        tracing::info!("Rune validated - allowing invoice_watch request through");
+
         let (internal_tx, mut internal_rx) =
             tokio::sync::mpsc::channel::<crate::events::types::Event>(64);
         let (proto_tx, proto_rx) = tokio::sync::mpsc::channel::<Result<cln_api::Event, Status>>(64);
@@ -412,8 +430,17 @@ impl NodeServices for ApiService {
 
     async fn watch_channels(
         &self,
-        _request: Request<()>,
+        request: Request<()>,
     ) -> Result<Response<Self::WatchChannelsStream>, Status> {
+        let rune = extract_rune_from_request(&request).ok_or_else(|| {
+            Status::unauthenticated(format!(
+                "Missing or empty Rune header '{}'. Provide a valid Rune for authentication.",
+                RUNE_HEADER
+            ))
+        })?;
+        validate_rune(&self.client, &rune, "watch_channels").await?;
+        tracing::info!("Rune validated - allowing watch_channels request through");
+
         let (internal_tx, mut internal_rx) =
             tokio::sync::mpsc::channel::<crate::events::types::Event>(64);
         let (proto_tx, proto_rx) = tokio::sync::mpsc::channel::<Result<cln_api::Event, Status>>(64);
@@ -449,8 +476,17 @@ impl NodeServices for ApiService {
 
     async fn watch_peers(
         &self,
-        _request: Request<()>,
+        request: Request<()>,
     ) -> Result<Response<Self::WatchPeersStream>, Status> {
+        let rune = extract_rune_from_request(&request).ok_or_else(|| {
+            Status::unauthenticated(format!(
+                "Missing or empty Rune header '{}'. Provide a valid Rune for authentication.",
+                RUNE_HEADER
+            ))
+        })?;
+        validate_rune(&self.client, &rune, "watch_peers").await?;
+        tracing::info!("Rune validated - allowing watch_peers request through");
+
         let (internal_tx, mut internal_rx) =
             tokio::sync::mpsc::channel::<crate::events::types::Event>(64);
         let (proto_tx, proto_rx) = tokio::sync::mpsc::channel::<Result<cln_api::Event, Status>>(64);
@@ -486,8 +522,17 @@ impl NodeServices for ApiService {
 
     async fn watch_system(
         &self,
-        _request: Request<()>,
+        request: Request<()>,
     ) -> Result<Response<Self::WatchSystemStream>, Status> {
+        let rune = extract_rune_from_request(&request).ok_or_else(|| {
+            Status::unauthenticated(format!(
+                "Missing or empty Rune header '{}'. Provide a valid Rune for authentication.",
+                RUNE_HEADER
+            ))
+        })?;
+        validate_rune(&self.client, &rune, "watch_system").await?;
+        tracing::info!("Rune validated - allowing watch_system request through");
+
         let (internal_tx, mut internal_rx) =
             tokio::sync::mpsc::channel::<crate::events::types::Event>(64);
         let (proto_tx, proto_rx) = tokio::sync::mpsc::channel::<Result<cln_api::Event, Status>>(64);
