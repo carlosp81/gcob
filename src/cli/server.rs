@@ -1,9 +1,29 @@
-use std::fs;
-use std::path::Path;
+use std::path::PathBuf;
 
-use crate::certs::generate::{self, CertError};
-use crate::certs::paths::{check_gcob_access, chown_recursive, detect_admin_user, ensure_cert_dir, setup_gcob_acls, ClientPaths, ClnSourcePaths, ServerPaths};
 use crate::certs::detect;
+use crate::certs::generate::{self, CertError};
+use crate::certs::paths::{
+    check_gcob_access, chown_recursive, detect_admin_account, ensure_cert_dir, setup_gcob_acls,
+    ClientPaths,
+};
+
+use super::provision::{self, InitServerRequest};
+
+/// Arguments collected by the CLI for `gcob init --server`.
+pub struct InitServerArgs {
+    pub force: bool,
+    pub no_confirm: bool,
+    pub hostname: Option<String>,
+    pub ip: Option<String>,
+    pub cln_dir: Option<PathBuf>,
+    pub haproxy_user: String,
+    pub api_user: String,
+    pub haproxy_cert_dir: PathBuf,
+    pub api_certs_dir: Option<PathBuf>,
+    pub rotate_ca: bool,
+    pub allow_loopback: bool,
+    pub dry_run: bool,
+}
 
 /// Handle `gcob init --client`
 /// Generates a CSR (Certificate Signing Request) - runs on CLIENT machine
@@ -18,16 +38,19 @@ pub fn handle_init_client(
 
     // Resolve identity: CLI flag > env var > auto-detect > default
     let identity = detect::resolve_identity(
-        client_hostname, client_ip,
-        "CLIENT_HOSTNAME", "CLIENT_IP",
-        "localhost", "127.0.0.1",
+        client_hostname,
+        client_ip,
+        "CLIENT_HOSTNAME",
+        "CLIENT_IP",
+        "localhost",
+        "127.0.0.1",
         false, // IP optional for client
     )?;
     let client_hostname = identity.hostname;
     let client_ip = identity.ip;
 
     // Always use the canonical path (~/.certs)
-    let client_paths = ClientPaths::default_path();
+    let client_paths = ClientPaths::default_path()?;
 
     // Check if CSR already exists
     let csr_path = client_paths.cert_dir.join("client.csr");
@@ -75,43 +98,59 @@ pub fn handle_init_client(
 
     // Step 2: Generate CSR
     println!("[2/4] Generating CSR...");
-    generate::generate_csr(&client_hostname, client_ip.as_deref(), &client_paths.cert_dir)?;
+    generate::generate_csr(
+        &client_hostname,
+        client_ip.as_deref(),
+        &client_paths.cert_dir,
+    )?;
     println!("[3/4] CSR generated successfully");
 
-    // Step 3: Set permissions, ownership and ACLs (silent)
+    // Step 3: Set permissions, ownership and ACLs
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         // Key: only owner can read
-        let _ = std::fs::set_permissions(
+        std::fs::set_permissions(
             &client_paths.client_key_file,
             std::fs::Permissions::from_mode(0o400),
-        );
+        )?;
         // CSR: readable by all
-        let _ = std::fs::set_permissions(
-            &client_paths.cert_dir.join("client.csr"),
+        std::fs::set_permissions(
+            client_paths.cert_dir.join("client.csr"),
             std::fs::Permissions::from_mode(0o444),
-        );
-        // Ownership to admin (not root)
-        let admin = detect_admin_user();
-        let _ = chown_recursive(&client_paths.cert_dir, &admin);
+        )?;
+        // Ownership to the admin account (never an unrelated account)
+        let account = detect_admin_account()?;
+        chown_recursive(&client_paths.cert_dir, account.uid, account.gid)?;
         // ACLs for gcob access
-        let _ = setup_gcob_acls();
+        setup_gcob_acls()?;
     }
 
     println!();
     println!("=== CSR generated successfully ===");
     println!();
     println!("Files:");
-    println!("  {}/client.csr      (send to server)", client_paths.cert_dir.display());
-    println!("  {}/client-key.pem  (keep secret)", client_paths.cert_dir.display());
+    println!(
+        "  {}/client.csr      (send to server)",
+        client_paths.cert_dir.display()
+    );
+    println!(
+        "  {}/client-key.pem  (keep secret)",
+        client_paths.cert_dir.display()
+    );
     println!();
     println!("Next steps:");
     println!("  1. Send client.csr to the server:");
-    println!("     scp {}/client.csr user@server:/tmp/", client_paths.cert_dir.display());
+    println!(
+        "     scp {}/client.csr user@server:/tmp/",
+        client_paths.cert_dir.display()
+    );
     println!();
     println!("  2. On the server, sign the CSR:");
-    println!("     gcob sign --csr /tmp/client.csr --hostname {}", client_hostname);
+    println!(
+        "     gcob sign --csr /tmp/client.csr --hostname {}",
+        client_hostname
+    );
     println!();
     println!("  3. Server will return: ca.pem + client.pem");
     println!("     Place them in: {}/", client_paths.cert_dir.display());
@@ -120,118 +159,101 @@ pub fn handle_init_client(
 }
 
 /// Handle `gcob init --server`
-/// Generates all server certificates signed by CLN's CA
-pub fn handle_init_server(
-    _force: bool,
-    _no_confirm: bool,
-    server_hostname: Option<&str>,
-    server_ip: Option<&str>,
-) -> Result<(), CertError> {
+///
+/// Preflight-validates CA, identity, destinations and existing material, then
+/// stages, verifies and atomically publishes the HAProxy and API certificates.
+pub fn handle_init_server(args: InitServerArgs) -> Result<(), CertError> {
     // Validate user has permission to manage certificates
     check_gcob_access()?;
 
-    // Resolve identity: CLI flag > env var > auto-detect > default
-    let identity = detect::resolve_identity(
-        server_hostname, server_ip,
-        "CLN_HOSTNAME", "CLN_IP",
-        "localhost", "127.0.0.1",
-        true, // IP required for server
-    )?;
+    let cln_dir = args.cln_dir.clone().ok_or_else(|| {
+        CertError::MissingSource(
+            "--cln-dir <PATH> is required for 'gcob init --server' \
+             (directory containing ca.pem and ca-key.pem)"
+                .to_string(),
+        )
+    })?;
+
+    // Resolve identity: CLI flag > auto-detect > default. Environment variables
+    // are intentionally ignored for the server identity (IS-4).
+    let identity =
+        detect::resolve_server_identity(args.hostname.as_deref(), args.ip.as_deref(), "localhost")?;
     let hostname = identity.hostname;
-    let ip = identity.ip.unwrap(); // safe: require_ip=true
-    let cln_source = ClnSourcePaths::default_home();
-    let server_paths = ServerPaths::default_path();
-    let client_paths = ClientPaths::default_path();
+    let ip = match identity.ip {
+        Some(ip) => ip,
+        None if args.allow_loopback => "127.0.0.1".to_string(),
+        None => {
+            return Err(CertError::Io(std::io::Error::other(
+                "Cannot detect the server IP; pass --server-ip <IP>",
+            )));
+        }
+    };
+    detect::validate_hostname(&hostname, args.allow_loopback)?;
+    detect::validate_unicast_ip(&ip, args.allow_loopback)?;
 
-    println!("=== Initializing gcob server certificates ===");
-    println!("  Hostname:     {}", hostname);
-    println!("  IP:           {}", ip);
-    println!("  CLN source:   {}", cln_source.dir.display());
-    println!("  HAProxy dir:  {}", server_paths.haproxy_cert_dir.display());
-    println!("  Bakog API:    {}", client_paths.cert_dir.display());
+    let api_certs_dir = match &args.api_certs_dir {
+        Some(dir) => dir.clone(),
+        None => ClientPaths::default_path()?.cert_dir,
+    };
+
+    let request = InitServerRequest {
+        cln_dir,
+        hostname,
+        ip,
+        haproxy_cert_dir: args.haproxy_cert_dir.clone(),
+        api_certs_dir,
+        haproxy_user: args.haproxy_user.clone(),
+        api_user: args.api_user.clone(),
+        force: args.force,
+        rotate_ca: args.rotate_ca,
+        dry_run: args.dry_run,
+        haproxy_owner: None,
+        api_owner: None,
+    };
+
+    let no_confirm = args.no_confirm;
+    let mut confirm = |text: &str| -> bool {
+        if no_confirm {
+            return true;
+        }
+        println!("{text}");
+        print!("Proceed? [y/N] ");
+        use std::io::Write;
+        std::io::stdout().flush().ok();
+
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).ok();
+        matches!(input.trim().to_lowercase().as_str(), "y" | "yes")
+    };
+
+    let summary = provision::provision_server(&request, &mut confirm)?;
+
     println!();
-
-    // Step 1: Read CA from CLN source
-    println!("[1/5] Reading CA from CLN source...");
-    let issuer = generate::read_cln_ca(&cln_source)?;
-    println!("  [✓] CA loaded");
-
-    // Step 2: Create directories
-    println!("[2/5] Creating directories...");
-    fs::create_dir_all(&server_paths.haproxy_cert_dir)?;
-    fs::create_dir_all(&server_paths.haproxy_ca_dir)?;
-    fs::create_dir_all(&client_paths.cert_dir)?;
-    println!("  [✓] {}", server_paths.haproxy_cert_dir.display());
-    println!("  [✓] {}", client_paths.cert_dir.display());
-
-    // Step 3: Copy CA to HAProxy ca-certs + ~/.certs/
-    println!("[3/5] Copying CA...");
-    generate::copy_file(&cln_source.ca_file, &server_paths.ca_file)?;
-    generate::copy_file(&cln_source.ca_key_file, &server_paths.ca_key_file)?;
-    generate::copy_file(&cln_source.ca_file, &client_paths.ca_file)?;
-    println!("  [✓] ca.pem copied to both directories");
-
-    // Step 4: Generate HAProxy server + client certs (mTLS 2 + 3)
-    let temp_dir = Path::new("/tmp/gcob_certs");
-    fs::create_dir_all(temp_dir)?;
-    println!("[4/5] Generating HAProxy certificates...");
-    generate::generate_server_cert(&issuer, &hostname, &ip, temp_dir)?;
-    generate::generate_client_cert(&issuer, &hostname, temp_dir)?;
-
-    // HAProxy bundles (cert+key concatenated)
-    generate::concat_cert_key(
-        &temp_dir.join("server.pem"),
-        &temp_dir.join("server-key.pem"),
-        &server_paths.server_concat_file,
-    )?;
-    generate::concat_cert_key(
-        &temp_dir.join("client.pem"),
-        &temp_dir.join("client-key.pem"),
-        &server_paths.client_concat_file,
-    )?;
-    println!("  [✓] HAProxy bundles created");
-
-    // Copy server cert to ~/.certs/ for API server (same host, shared cert)
-    generate::copy_file(
-        &temp_dir.join("server.pem"),
-        &client_paths.cert_dir.join("server.pem"),
-    )?;
-    generate::copy_file(
-        &temp_dir.join("server-key.pem"),
-        &client_paths.cert_dir.join("server-key.pem"),
-    )?;
-    println!("  [✓] Server cert copied to {}/", client_paths.cert_dir.display());
-
-    // Step 5: Set permissions
-    println!("[5/5] Setting permissions...");
-    let _ = fs::remove_dir_all(temp_dir);
-    #[cfg(unix)]
-    {
-        generate::set_permissions(&server_paths.haproxy_cert_dir, 0o700)?;
-        generate::set_permissions(&server_paths.haproxy_ca_dir, 0o700)?;
-        generate::set_permissions(&server_paths.ca_file, 0o444)?;
-        generate::set_permissions(&server_paths.ca_key_file, 0o400)?;
-        generate::set_permissions(&server_paths.server_concat_file, 0o600)?;
-        generate::set_permissions(&server_paths.client_concat_file, 0o600)?;
-        generate::set_permissions(&client_paths.cert_dir, 0o700)?;
-        let _ = generate::set_permissions(&client_paths.ca_file, 0o444);
-        let _ = generate::set_permissions(&client_paths.cert_dir.join("server.pem"), 0o444);
-        let _ = generate::set_permissions(&client_paths.cert_dir.join("server-key.pem"), 0o400);
+    if args.dry_run {
+        println!("=== Dry run complete: no files were written ===");
+    } else {
+        println!("=== Server certificates provisioned ===");
     }
-    println!("  [✓] Done");
-
     println!();
-    println!("=== Server certificates generated ===");
+    println!("CA fingerprint (SHA-256): {}", summary.ca_fingerprint);
+    for file in &summary.files {
+        match &file.fingerprint {
+            Some(fingerprint) => println!(
+                "  {} (mode {:04o}) sha256:{}",
+                file.path.display(),
+                file.mode,
+                fingerprint
+            ),
+            None => println!("  {} (mode {:04o})", file.path.display(), file.mode),
+        }
+    }
     println!();
-    println!("HAProxy (mTLS 2 + 3):");
-    println!("  {}", server_paths.server_concat_file.display());
-    println!("  {}", server_paths.client_concat_file.display());
-    println!();
-    println!("Bakog API (server):");
-    println!("  {}/server.pem", client_paths.cert_dir.display());
-    println!();
-    println!("To sign external client CSR:");
-    println!("  gcob sign --csr /tmp/client.csr --hostname <CLIENT_IP>");
+    println!(
+        "Point CLN_CERT_DIR at {} before starting 'gcob serve'.",
+        request.api_certs_dir.display()
+    );
+    println!("To sign external client CSRs:");
+    println!("  gcob sign --csr <file.csr> --hostname <CLIENT_HOST>");
 
     Ok(())
 }
