@@ -3,13 +3,19 @@ use clap::Parser;
 mod cli;
 
 // Re-export library modules so cli/* can use crate::certs, crate::cln, etc.
-pub use gcob::{certs, cln, domain, events, grpc, infra};
+pub use gcob::{certs, cln, config, domain, events, grpc, infra};
 
 use cli::{Cli, Commands};
 
 #[tokio::main]
 async fn main() {
-    dotenvy::dotenv().ok();
+    gcob::config::load_trusted_env();
+
+    // Mode-specific help: `gcob init --client|--server --help` only shows the
+    // arguments relevant to that mode. `gcob init --help` keeps the full help.
+    if cli::maybe_print_init_help() {
+        return;
+    }
 
     // Initialize tracing
     tracing_subscriber::fmt()
@@ -29,6 +35,14 @@ async fn main() {
             server_hostname,
             server_ip,
             no_confirm,
+            cln_dir,
+            haproxy_user,
+            api_user,
+            haproxy_cert_dir,
+            api_certs_dir,
+            rotate_ca,
+            allow_loopback,
+            dry_run,
         } => {
             if client {
                 if let Err(e) = cli::server::handle_init_client(
@@ -41,12 +55,21 @@ async fn main() {
                     std::process::exit(1);
                 }
             } else if server {
-                if let Err(e) = cli::server::handle_init_server(
+                let args = cli::server::InitServerArgs {
                     force,
                     no_confirm,
-                    server_hostname.as_deref(),
-                    server_ip.as_deref(),
-                ) {
+                    hostname: server_hostname,
+                    ip: server_ip,
+                    cln_dir,
+                    haproxy_user,
+                    api_user,
+                    haproxy_cert_dir,
+                    api_certs_dir,
+                    rotate_ca,
+                    allow_loopback,
+                    dry_run,
+                };
+                if let Err(e) = cli::server::handle_init_server(args) {
                     eprintln!("Error: {}", e);
                     std::process::exit(1);
                 }
@@ -65,22 +88,29 @@ async fn main() {
         Commands::Sign {
             csr,
             hostname,
+            cln_dir,
             output,
+            force,
+            dry_run,
+            expected_ca_fingerprint,
         } => {
-            let output_path = match output {
-                Some(p) => p,
-                None => gcob::certs::paths::default_cert_dir(),
+            let args = cli::certs::SignArgs {
+                csr,
+                hostname,
+                cln_dir,
+                output,
+                force,
+                dry_run,
+                expected_ca_fingerprint,
             };
-            if let Err(e) = cli::certs::handle_sign(&csr, &hostname, &output_path) {
+            if let Err(e) = cli::certs::handle_sign(args) {
                 eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
         }
-        Commands::Certs { dir: _, command } => {
-            match command {
-                Some(cmd) => cli::certs::dispatch(cmd),
-                None => cli::certs::handle_no_subcommand(),
-            }
-        }
+        Commands::Certs { dir: _, command } => match command {
+            Some(cmd) => cli::certs::dispatch(cmd),
+            None => cli::certs::handle_no_subcommand(),
+        },
     }
 }
