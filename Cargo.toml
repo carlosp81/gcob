@@ -39,6 +39,9 @@ clap = { version = "4", features = ["derive", "env"] }
 rcgen = { version = "0.14", features = ["pem", "x509-parser"] }
 x509-parser = { version = "0.18", features = ["verify"] }
 chrono = "0.4"
+tempfile = "3"
+time = "0.3"
+zeroize = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

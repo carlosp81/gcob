@@ -637,6 +637,8 @@ dependencies = [
  "rustls-pemfile",
  "serde_json",
  "sha2",
+ "tempfile",
+ "time",
  "tokio",
  "tokio-rustls",
  "tokio-stream",
@@ -648,6 +650,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "x509-parser",
+ "zeroize",
 ]
 
 [[package]]
