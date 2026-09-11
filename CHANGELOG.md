@@ -1,5 +1,33 @@
 # Changelog
 
+## [0.4.3] - 2026-09-11
+
+Security hardening across the CLI, `init --server`, `sign` and `certs renew`.
+
+### Fixed
+- **SECURITY**: `sign_csr` now rebuilds subject/SAN/EKU/basicConstraints/validity from `--hostname` and uses only the CSR public key (previous behavior could copy CA:TRUE/keyCertSign or foreign SANs from the CSR)
+- **SECURITY**: `init --server`, `sign` and `renew` load the CLN CA via `load_validated_ca` (symlink/permission checks, CA:TRUE, key↔cert match, SHA-256 fingerprint, zeroized key material) from an explicit `--cln-dir`
+- **SECURITY**: CA fingerprint pinning; changing an installed CA requires `--rotate-ca`, installing a missing one requires `--init-ca`
+- **SECURITY**: Certificate issuance validates hostnames (no wildcards/control chars) and IPs (unicast only); `sign --output` and `--cln-dir` are explicit
+- **SECURITY**: `certs verify` performs real signature verification and exact SAN matching, and no longer relies on `$HOME`
+- **SECURITY**: `.env` is loaded only from trusted absolute paths (`GCOB_ENV_FILE` / `/etc/gcob/gcob.env`); the API server validates the gcob account by real UID instead of `$USER`
+- **SECURITY**: The CLI verifies the requested TLS hostname; unsafe CA key copies and the `/tmp/gcob_certs` staging path were removed
+- **SECURITY**: Client hardening: safe gRPC metadata handling, UTF-8-safe truncation, control-character sanitization, integer-only amount parsing and connection/keepalive timeouts
+
+### Added
+- `gcob init --server` flags: `--cln-dir`, `--haproxy-user`, `--api-user`, `--haproxy-cert-dir`, `--api-certs-dir`, `--rotate-ca`, `--allow-loopback`, `--dry-run`
+- `gcob sign` flags: `--cln-dir` and `--output` (required), `--force`, `--dry-run`, `--expected-ca-fingerprint`
+- `gcob certs renew` flags: `--cln-dir`, `--init-ca`, `--rotate-ca`, `--api-user`, `--allow-loopback`, `--dry-run`
+- Atomic publication with `.bak.<epoch>` backups, rollback and `flock` for init/sign/renew
+- Mode-specific help: `gcob init --client|--server --help`
+- Independent API client certificate for the API→CLN connection
+- 166 unit tests (CLI, PKI, config, init/sign/renew)
+
+### Changed
+- `gcob init --server` publishes HAProxy material as `root:haproxy` (0640) and API material owned by `--api-user` (keys 0600)
+- Legacy `setup_certs.sh` flow deprecated (replacement: `gcob init --server`)
+- `read_cln_ca` and `ClnSourcePaths::default_home` removed
+
 ## [0.4.2] - 2026-09-11
 
 ### Fixed
