@@ -41,6 +41,7 @@ pub async fn run(client: &mut NodeClient<Channel>, tx: mpsc::Sender<Event>) {
                             amount_msat: n.msat.as_ref().map(|a| a.msat),
                             description: String::new(),
                             bolt11: String::new(),
+                            expiry: None,
                         });
                         let _ = tx.send(event).await;
                     }

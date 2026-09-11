@@ -62,6 +62,7 @@ pub enum InvoiceEvent {
         amount_msat: Option<u64>,
         description: String,
         bolt11: String,
+        expiry: Option<u64>,
     },
     Paid {
         event_id: EventId,

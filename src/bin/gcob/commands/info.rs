@@ -1,10 +1,15 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tonic::transport::Channel;
 
 pub async fn run(channel: Channel) -> Result<()> {
+    let rune = std::env::var("GCOD_RUNE").context("GCOD_RUNE not set")?;
+
     let mut client = gcob::cln::cln_api::node_services_client::NodeServicesClient::new(channel);
 
-    let request = tonic::Request::new(gcob::cln::cln_api::GetinfoRequest {});
+    let mut request = tonic::Request::new(gcob::cln::cln_api::GetinfoRequest {});
+    request
+        .metadata_mut()
+        .insert("x-rune", rune.parse().unwrap());
 
     let response = client.getinfo(request).await?.into_inner();
 

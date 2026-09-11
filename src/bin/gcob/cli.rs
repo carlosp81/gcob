@@ -31,6 +31,10 @@ pub struct Cli {
     #[arg(long, env = "GCOD_RUNE", global = true)]
     pub rune: Option<String>,
 
+    /// Client identifier for rate limiting (env: GCOD_CLIENT_ID)
+    #[arg(long, env = "GCOD_CLIENT_ID", global = true)]
+    pub client_id: Option<String>,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -53,6 +57,10 @@ pub enum Commands {
         /// Invoice description
         #[arg(short, long)]
         description: Option<String>,
+
+        /// Invoice expiry in seconds (default: 3600)
+        #[arg(short = 'e', long)]
+        expiry: Option<u64>,
     },
 
     /// Pay a BOLT11 invoice and watch for completion

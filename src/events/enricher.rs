@@ -240,6 +240,7 @@ mod tests {
             amount_msat: Some(5000),
             description: "Test".into(),
             bolt11: "lnbc...".into(),
+            expiry: None,
         };
         let r = invoice_recommendation(&e);
         assert!(r.summary.contains("order-42"));

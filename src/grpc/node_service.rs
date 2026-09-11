@@ -142,6 +142,7 @@ impl NodeServices for ApiService {
                 _ => None,
             });
         let req_description = request.get_ref().description.clone();
+        let req_expiry = request.get_ref().expiry;
         let cln_response = create::create_invoice(&self.client, request).await?;
         let cln_res = cln_response.into_inner();
 
@@ -158,6 +159,7 @@ impl NodeServices for ApiService {
                 amount_msat: req_amount,
                 description: req_description.clone(),
                 bolt11: cln_res.bolt11.clone(),
+                expiry: req_expiry,
             },
         );
         let proto_created = crate::domain::invoice::watch::to_proto_event(&internal_event)
@@ -172,6 +174,7 @@ impl NodeServices for ApiService {
                         description: req_description,
                         bolt11: cln_res.bolt11.clone(),
                         recommendation: String::new(),
+                        expiry: req_expiry,
                     })),
                 }
             });

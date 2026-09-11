@@ -11,6 +11,7 @@ pub fn to_proto_event(event: &types::Event) -> Option<cln_api::Event> {
                 amount_msat,
                 description,
                 bolt11,
+                expiry,
             } => {
                 let rec = crate::events::enricher::invoice_recommendation(e);
                 tracing::info!(
@@ -28,6 +29,7 @@ pub fn to_proto_event(event: &types::Event) -> Option<cln_api::Event> {
                             description: description.clone(),
                             bolt11: bolt11.clone(),
                             recommendation: format!("{}. {}", rec.summary, rec.action),
+                            expiry: *expiry,
                         },
                     )),
                 })

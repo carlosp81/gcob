@@ -6,7 +6,7 @@ use gcob::cln::cln_api;
 use gcob::cln::cln_api::node_services_client::NodeServicesClient;
 use gcob::cln::cln_api::XpayRequest;
 
-pub async fn run(channel: Channel, invoice: &str, maxfee: Option<&str>) -> Result<()> {
+pub async fn run(channel: Channel, client_id: &str, invoice: &str, maxfee: Option<&str>) -> Result<()> {
     let rune = std::env::var("GCOD_RUNE").context("GCOD_RUNE not set")?;
 
     let mut client = NodeServicesClient::new(channel);
@@ -40,6 +40,9 @@ pub async fn run(channel: Channel, invoice: &str, maxfee: Option<&str>) -> Resul
     request
         .metadata_mut()
         .insert("x-rune", rune.parse().unwrap());
+    request
+        .metadata_mut()
+        .insert("x-client-id", client_id.parse().unwrap());
 
     let mut stream = client
         .xpay_stream_watch(request)

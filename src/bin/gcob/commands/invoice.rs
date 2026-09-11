@@ -8,9 +8,11 @@ use gcob::cln::cln_api::InvoiceRequest;
 
 pub async fn run(
     channel: Channel,
+    client_id: &str,
     label: &str,
     amount: &str,
     description: Option<&str>,
+    expiry: Option<u64>,
 ) -> Result<()> {
     let rune = std::env::var("GCOD_RUNE").context("GCOD_RUNE not set")?;
 
@@ -27,7 +29,7 @@ pub async fn run(
         }),
         label: label.to_string(),
         description: description.unwrap_or("").to_string(),
-        expiry: None,
+        expiry,
         cltv: None,
         fallbacks: vec![],
         preimage: None,
@@ -43,6 +45,9 @@ pub async fn run(
     request
         .metadata_mut()
         .insert("x-rune", rune.parse().unwrap());
+    request
+        .metadata_mut()
+        .insert("x-client-id", client_id.parse().unwrap());
 
     let mut stream = client
         .invoice_stream(request)
@@ -64,6 +69,9 @@ pub async fn run(
                     println!("  Amount: {} msat", amt);
                 }
                 println!("  Description: {}", inv.description);
+                if let Some(exp) = inv.expiry {
+                    println!("  Expiry: {} seconds", exp);
+                }
                 println!();
                 println!("{} Watching for payment...", now);
                 invoice_created = true;

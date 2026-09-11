@@ -33,6 +33,7 @@ message InvoiceCreated {
   string description = 5;
   string bolt11 = 6;
   string recommendation = 7;
+  optional uint64 expiry = 8;
 }
 
 message InvoicePaid {
