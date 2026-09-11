@@ -6,9 +6,15 @@ use gcob::cln::cln_api;
 use gcob::cln::cln_api::node_services_client::NodeServicesClient;
 use gcob::cln::cln_api::XpayRequest;
 
-pub async fn run(channel: Channel, client_id: &str, invoice: &str, maxfee: Option<&str>) -> Result<()> {
-    let rune = std::env::var("GCOD_RUNE").context("GCOD_RUNE not set")?;
+use super::{insert_header, sanitize};
 
+pub async fn run(
+    channel: Channel,
+    rune: &str,
+    client_id: &str,
+    invoice: &str,
+    maxfee: Option<&str>,
+) -> Result<()> {
     let mut client = NodeServicesClient::new(channel);
 
     let maxfee_amount = if let Some(fee_str) = maxfee {
@@ -37,12 +43,8 @@ pub async fn run(channel: Channel, client_id: &str, invoice: &str, maxfee: Optio
     println!("{} Paying invoice...", now);
 
     let mut request = Request::new(request);
-    request
-        .metadata_mut()
-        .insert("x-rune", rune.parse().unwrap());
-    request
-        .metadata_mut()
-        .insert("x-client-id", client_id.parse().unwrap());
+    insert_header(request.metadata_mut(), "x-rune", rune)?;
+    insert_header(request.metadata_mut(), "x-client-id", client_id)?;
 
     let mut stream = client
         .xpay_stream_watch(request)
@@ -58,19 +60,19 @@ pub async fn run(channel: Channel, client_id: &str, invoice: &str, maxfee: Optio
                 println!("{} PaymentSucceeded:", now);
                 println!("  Amount: {} msat", payment.amount_msat);
                 println!("  Amount sent: {} msat", payment.amount_sent_msat);
-                println!("  Payment hash: {}", payment.payment_hash);
-                println!("  Node: {}", payment.node_id);
+                println!("  Payment hash: {}", sanitize(&payment.payment_hash));
+                println!("  Node: {}", sanitize(&payment.node_id));
                 if !payment.recommendation.is_empty() {
-                    println!("  Recommendation: {}", payment.recommendation);
+                    println!("  Recommendation: {}", sanitize(&payment.recommendation));
                 }
                 break;
             }
             cln_api::event::Event::PaymentFailed(failure) => {
                 println!("{} PaymentFailed:", now);
-                println!("  Payment hash: {}", failure.payment_hash);
-                println!("  Reason: {}", failure.failure_reason);
+                println!("  Payment hash: {}", sanitize(&failure.payment_hash));
+                println!("  Reason: {}", sanitize(&failure.failure_reason));
                 if !failure.recommendation.is_empty() {
-                    println!("  Recommendation: {}", failure.recommendation);
+                    println!("  Recommendation: {}", sanitize(&failure.recommendation));
                 }
                 break;
             }
@@ -84,12 +86,30 @@ pub async fn run(channel: Channel, client_id: &str, invoice: &str, maxfee: Optio
 fn parse_msat(s: &str) -> Result<u64> {
     let s = s.trim().to_lowercase();
     if let Some(v) = s.strip_suffix("msat") {
-        v.parse::<u64>().context("Invalid msat amount")
+        v.trim().parse::<u64>().context("Invalid msat amount")
     } else if let Some(v) = s.strip_suffix("sat") {
-        v.parse::<u64>()
-            .map(|v| v * 1000)
-            .context("Invalid sat amount")
+        let sats: u64 = v.trim().parse().context("Invalid sat amount")?;
+        sats.checked_mul(1000).context("Amount too large")
     } else {
-        s.parse::<u64>().context("Invalid amount (use Nmsat or Nsat)")
+        s.parse::<u64>()
+            .context("Invalid amount (use Nmsat or Nsat)")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_msat_accepts_units() {
+        assert_eq!(parse_msat("1000msat").unwrap(), 1000);
+        assert_eq!(parse_msat("5sat").unwrap(), 5000);
+        assert_eq!(parse_msat("42").unwrap(), 42);
+    }
+
+    #[test]
+    fn parse_msat_rejects_overflow() {
+        let too_large_sat = (u64::MAX / 1000 + 1).to_string();
+        assert!(parse_msat(&format!("{}sat", too_large_sat)).is_err());
     }
 }

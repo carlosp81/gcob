@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use tonic::transport::Channel;
 use tonic::Request;
 
@@ -6,16 +6,17 @@ use gcob::cln::cln_api;
 use gcob::cln::cln_api::node_services_client::NodeServicesClient;
 use gcob::cln::cln_api::InvoiceRequest;
 
+use super::{insert_header, sanitize};
+
 pub async fn run(
     channel: Channel,
+    rune: &str,
     client_id: &str,
     label: &str,
     amount: &str,
     description: Option<&str>,
     expiry: Option<u64>,
 ) -> Result<()> {
-    let rune = std::env::var("GCOD_RUNE").context("GCOD_RUNE not set")?;
-
     let mut client = NodeServicesClient::new(channel);
 
     // Parse amount: accept "35000msat", "35000", "0.035btc", "35000sat"
@@ -42,12 +43,8 @@ pub async fn run(
     println!("{} Creating invoice...", now);
 
     let mut request = Request::new(request);
-    request
-        .metadata_mut()
-        .insert("x-rune", rune.parse().unwrap());
-    request
-        .metadata_mut()
-        .insert("x-client-id", client_id.parse().unwrap());
+    insert_header(request.metadata_mut(), "x-rune", rune)?;
+    insert_header(request.metadata_mut(), "x-client-id", client_id)?;
 
     let mut stream = client
         .invoice_stream(request)
@@ -63,12 +60,12 @@ pub async fn run(
         match event {
             cln_api::event::Event::InvoiceCreated(inv) => {
                 println!("{} Invoice created:", now);
-                println!("  Bolt11: {}", inv.bolt11);
-                println!("  Label: {}", inv.label);
+                println!("  Bolt11: {}", sanitize(&inv.bolt11));
+                println!("  Label: {}", sanitize(&inv.label));
                 if let Some(amt) = inv.amount_msat {
                     println!("  Amount: {} msat", amt);
                 }
-                println!("  Description: {}", inv.description);
+                println!("  Description: {}", sanitize(&inv.description));
                 if let Some(exp) = inv.expiry {
                     println!("  Expiry: {} seconds", exp);
                 }
@@ -77,12 +74,9 @@ pub async fn run(
                 invoice_created = true;
             }
             cln_api::event::Event::InvoicePaid(paid) => {
-                println!(
-                    "{} InvoicePaid: {} msat received",
-                    now, paid.amount_msat
-                );
-                println!("  Label: {}", paid.label);
-                println!("  Payment hash: {}", paid.payment_hash);
+                println!("{} InvoicePaid: {} msat received", now, paid.amount_msat);
+                println!("  Label: {}", sanitize(&paid.label));
+                println!("  Payment hash: {}", sanitize(&paid.payment_hash));
                 break;
             }
             _ => {}
@@ -90,7 +84,7 @@ pub async fn run(
     }
 
     if !invoice_created {
-        anyhow::bail!("Stream ended without receiving InvoiceCreated");
+        bail!("Stream ended without receiving InvoiceCreated");
     }
 
     Ok(())
@@ -99,17 +93,86 @@ pub async fn run(
 fn parse_amount(s: &str) -> Result<u64> {
     let s = s.trim().to_lowercase();
     if let Some(v) = s.strip_suffix("msat") {
-        v.parse::<u64>()
-            .context("Invalid msat amount")
+        v.trim().parse::<u64>().context("Invalid msat amount")
     } else if let Some(v) = s.strip_suffix("sat") {
-        v.parse::<u64>()
-            .map(|v| v * 1000)
-            .context("Invalid sat amount")
+        let sats: u64 = v.trim().parse().context("Invalid sat amount")?;
+        sats.checked_mul(1000).context("Amount too large")
     } else if let Some(v) = s.strip_suffix("btc") {
-        v.parse::<f64>()
-            .map(|v| (v * 100_000_000.0 * 1000.0) as u64)
-            .context("Invalid btc amount")
+        parse_btc_to_msat(v.trim())
     } else {
-        s.parse::<u64>().context("Invalid amount (use Nmsat, Nsat, or Nbtc)")
+        s.parse::<u64>()
+            .context("Invalid amount (use Nmsat, Nsat, or Nbtc)")
+    }
+}
+
+/// Parse a BTC amount with integer math and up to 11 decimal places
+/// (1 msat = 1e-11 BTC). Never uses floating point.
+fn parse_btc_to_msat(value: &str) -> Result<u64> {
+    if value.is_empty() || value.starts_with('-') || value.starts_with('+') {
+        bail!("Invalid btc amount");
+    }
+
+    let (whole, frac) = match value.split_once('.') {
+        Some((whole, frac)) => (whole, frac),
+        None => (value, ""),
+    };
+
+    if frac.len() > 11
+        || !whole.chars().all(|c| c.is_ascii_digit())
+        || !frac.chars().all(|c| c.is_ascii_digit())
+    {
+        bail!("Invalid btc amount (max 11 decimals)");
+    }
+
+    let whole: u64 = if whole.is_empty() {
+        0
+    } else {
+        whole.parse().context("Invalid btc amount")?
+    };
+    let whole_msat = whole
+        .checked_mul(100_000_000_000)
+        .context("Amount too large")?;
+
+    let frac_msat = if frac.is_empty() {
+        0
+    } else {
+        let mut padded = frac.to_string();
+        while padded.len() < 11 {
+            padded.push('0');
+        }
+        padded.parse::<u64>().context("Invalid btc amount")?
+    };
+
+    whole_msat
+        .checked_add(frac_msat)
+        .context("Amount too large")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_amount_accepts_units() {
+        assert_eq!(parse_amount("35000msat").unwrap(), 35_000);
+        assert_eq!(parse_amount("35000").unwrap(), 35_000);
+        assert_eq!(parse_amount("35sat").unwrap(), 35_000);
+        assert_eq!(parse_amount("0.000000035btc").unwrap(), 3_500);
+        assert_eq!(parse_amount("1btc").unwrap(), 100_000_000_000);
+    }
+
+    #[test]
+    fn parse_amount_rejects_overflow() {
+        let too_large_sat = (u64::MAX / 1000 + 1).to_string();
+        assert!(parse_amount(&format!("{}sat", too_large_sat)).is_err());
+        assert!(parse_amount(&format!("{}sat", u64::MAX)).is_err());
+    }
+
+    #[test]
+    fn parse_amount_rejects_invalid() {
+        assert!(parse_amount("-1btc").is_err());
+        assert!(parse_amount("1e3btc").is_err());
+        assert!(parse_amount("0.000000000001btc").is_err()); // 12 decimals
+        assert!(parse_amount("abc").is_err());
     }
 }

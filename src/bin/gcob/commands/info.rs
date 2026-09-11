@@ -1,15 +1,13 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use tonic::transport::Channel;
 
-pub async fn run(channel: Channel) -> Result<()> {
-    let rune = std::env::var("GCOD_RUNE").context("GCOD_RUNE not set")?;
+use super::{insert_header, sanitize};
 
+pub async fn run(channel: Channel, rune: &str) -> Result<()> {
     let mut client = gcob::cln::cln_api::node_services_client::NodeServicesClient::new(channel);
 
     let mut request = tonic::Request::new(gcob::cln::cln_api::GetinfoRequest {});
-    request
-        .metadata_mut()
-        .insert("x-rune", rune.parse().unwrap());
+    insert_header(request.metadata_mut(), "x-rune", rune)?;
 
     let response = client.getinfo(request).await?.into_inner();
 
@@ -17,15 +15,15 @@ pub async fn run(channel: Channel) -> Result<()> {
     let color_hex = hex::encode(&response.color);
 
     println!("Node Information:");
-    println!("  Alias: {}", response.alias);
+    println!("  Alias: {}", sanitize(&response.alias));
     println!("  ID: {}", id_hex);
     println!("  Color: #{}", color_hex);
     println!("  Peers: {}", response.num_peers);
     println!("  Channels: {}", response.num_active_channels);
     println!("  Block height: {}", response.blockheight);
-    println!("  Network: {}", response.network);
-    println!("  Version: {}", response.version);
-    println!("  Lightning dir: {}", response.lightning_dir);
+    println!("  Network: {}", sanitize(&response.network));
+    println!("  Version: {}", sanitize(&response.version));
+    println!("  Lightning dir: {}", sanitize(&response.lightning_dir));
 
     Ok(())
 }

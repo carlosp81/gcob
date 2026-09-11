@@ -7,33 +7,35 @@ use gcob::cln::cln_api::node_services_client::NodeServicesClient;
 
 use crate::cli::WatchTarget;
 
-pub async fn run(channel: Channel, target: WatchTarget) -> Result<()> {
-    let rune = std::env::var("GCOD_RUNE").context("GCOD_RUNE not set")?;
+use super::{insert_header, sanitize, truncate_utf8};
 
+pub async fn run(channel: Channel, rune: &str, target: WatchTarget) -> Result<()> {
     let mut client = NodeServicesClient::new(channel);
 
     let now = chrono::Local::now().format("[%Y-%m-%d %H:%M:%S]");
-    println!("{} Watching {} events... (Ctrl+C to stop)", now, target.name());
+    println!(
+        "{} Watching {} events... (Ctrl+C to stop)",
+        now,
+        target.name()
+    );
 
     match target {
-        WatchTarget::Payment => watch_payments(&mut client, &rune).await,
-        WatchTarget::Invoice => watch_invoices(&mut client, &rune).await,
-        WatchTarget::Channel => watch_channels(&mut client, &rune).await,
-        WatchTarget::Peer => watch_peers(&mut client, &rune).await,
-        WatchTarget::System => watch_system(&mut client, &rune).await,
+        WatchTarget::Payment => watch_payments(&mut client, rune).await,
+        WatchTarget::Invoice => watch_invoices(&mut client, rune).await,
+        WatchTarget::Channel => watch_channels(&mut client, rune).await,
+        WatchTarget::Peer => watch_peers(&mut client, rune).await,
+        WatchTarget::System => watch_system(&mut client, rune).await,
     }
 }
 
-fn with_rune(rune: &str) -> Request<()> {
+fn with_rune(rune: &str) -> Result<Request<()>> {
     let mut request = Request::new(());
-    request
-        .metadata_mut()
-        .insert("x-rune", rune.parse().unwrap());
-    request
+    insert_header(request.metadata_mut(), "x-rune", rune)?;
+    Ok(request)
 }
 
 async fn watch_payments(client: &mut NodeServicesClient<Channel>, rune: &str) -> Result<()> {
-    let request = with_rune(rune);
+    let request = with_rune(rune)?;
     let mut stream = client
         .xpay_stream(request)
         .await
@@ -49,7 +51,7 @@ async fn watch_payments(client: &mut NodeServicesClient<Channel>, rune: &str) ->
 }
 
 async fn watch_invoices(client: &mut NodeServicesClient<Channel>, rune: &str) -> Result<()> {
-    let request = with_rune(rune);
+    let request = with_rune(rune)?;
     let mut stream = client
         .invoice_watch(request)
         .await
@@ -65,7 +67,7 @@ async fn watch_invoices(client: &mut NodeServicesClient<Channel>, rune: &str) ->
 }
 
 async fn watch_channels(client: &mut NodeServicesClient<Channel>, rune: &str) -> Result<()> {
-    let request = with_rune(rune);
+    let request = with_rune(rune)?;
     let mut stream = client
         .watch_channels(request)
         .await
@@ -81,7 +83,7 @@ async fn watch_channels(client: &mut NodeServicesClient<Channel>, rune: &str) ->
 }
 
 async fn watch_peers(client: &mut NodeServicesClient<Channel>, rune: &str) -> Result<()> {
-    let request = with_rune(rune);
+    let request = with_rune(rune)?;
     let mut stream = client
         .watch_peers(request)
         .await
@@ -97,7 +99,7 @@ async fn watch_peers(client: &mut NodeServicesClient<Channel>, rune: &str) -> Re
 }
 
 async fn watch_system(client: &mut NodeServicesClient<Channel>, rune: &str) -> Result<()> {
-    let request = with_rune(rune);
+    let request = with_rune(rune)?;
     let mut stream = client
         .watch_system(request)
         .await
@@ -114,7 +116,11 @@ async fn watch_system(client: &mut NodeServicesClient<Channel>, rune: &str) -> R
 
 fn ts(seconds: i64) -> String {
     chrono::DateTime::from_timestamp(seconds, 0)
-        .map(|dt| dt.with_timezone(&chrono::Local).format("[%Y-%m-%d %H:%M:%S]").to_string())
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("[%Y-%m-%d %H:%M:%S]")
+                .to_string()
+        })
         .unwrap_or_else(|| format!("[{}]", seconds))
 }
 
@@ -123,13 +129,18 @@ fn print_payment_event(event: &cln_api::event::Event) {
         cln_api::event::Event::PaymentSucceeded(p) => {
             println!(
                 "{} PaymentSucceeded: {} msat (sent: {} msat) hash={}",
-                ts(p.timestamp), p.amount_msat, p.amount_sent_msat, p.payment_hash
+                ts(p.timestamp),
+                p.amount_msat,
+                p.amount_sent_msat,
+                sanitize(&p.payment_hash)
             );
         }
         cln_api::event::Event::PaymentFailed(p) => {
             println!(
                 "{} PaymentFailed: reason={} hash={}",
-                ts(p.timestamp), p.failure_reason, p.payment_hash
+                ts(p.timestamp),
+                sanitize(&p.failure_reason),
+                sanitize(&p.payment_hash)
             );
         }
         _ => {}
@@ -140,16 +151,18 @@ fn print_invoice_event(event: &cln_api::event::Event) {
     match event {
         cln_api::event::Event::InvoiceCreated(inv) => {
             println!(
-                "{} InvoiceCreated: label={} bolt11={}...",
+                "{} InvoiceCreated: label={} bolt11={}",
                 ts(inv.timestamp),
-                inv.label,
-                &inv.bolt11[..inv.bolt11.len().min(40)]
+                sanitize(&inv.label),
+                truncate_utf8(&inv.bolt11, 40)
             );
         }
         cln_api::event::Event::InvoicePaid(p) => {
             println!(
                 "{} InvoicePaid: label={} amount={}msat",
-                ts(p.timestamp), p.label, p.amount_msat
+                ts(p.timestamp),
+                sanitize(&p.label),
+                p.amount_msat
             );
         }
         _ => {}
@@ -162,17 +175,24 @@ fn print_channel_event(event: &cln_api::event::Event) {
             println!(
                 "{} ChannelOpened: node={} amount={}msat",
                 ts(c.timestamp),
-                &c.node_id[..c.node_id.len().min(16)],
+                truncate_utf8(&c.node_id, 16),
                 c.amount_msat
             );
         }
         cln_api::event::Event::ChannelOpenFailed(c) => {
-            println!("{} ChannelOpenFailed: reason={}", ts(c.timestamp), c.reason);
+            println!(
+                "{} ChannelOpenFailed: reason={}",
+                ts(c.timestamp),
+                sanitize(&c.reason)
+            );
         }
         cln_api::event::Event::ChannelStateChanged(c) => {
             println!(
                 "{} ChannelStateChanged: {} {} -> {}",
-                ts(c.timestamp), c.channel_id, c.old_state, c.new_state
+                ts(c.timestamp),
+                sanitize(&c.channel_id),
+                sanitize(&c.old_state),
+                sanitize(&c.new_state)
             );
         }
         _ => {}
@@ -185,15 +205,15 @@ fn print_peer_event(event: &cln_api::event::Event) {
             println!(
                 "{} PeerConnected: node={} addr={}",
                 ts(p.timestamp),
-                &p.node_id[..p.node_id.len().min(16)],
-                p.addr
+                truncate_utf8(&p.node_id, 16),
+                sanitize(&p.addr)
             );
         }
         cln_api::event::Event::PeerDisconnected(p) => {
             println!(
                 "{} PeerDisconnected: node={}",
                 ts(p.timestamp),
-                &p.node_id[..p.node_id.len().min(16)]
+                truncate_utf8(&p.node_id, 16)
             );
         }
         _ => {}
@@ -203,7 +223,7 @@ fn print_peer_event(event: &cln_api::event::Event) {
 fn print_system_event(event: &cln_api::event::Event) {
     match event {
         cln_api::event::Event::SystemWarning(w) => {
-            println!("{} SystemWarning: {}", ts(w.timestamp), w.log);
+            println!("{} SystemWarning: {}", ts(w.timestamp), sanitize(&w.log));
         }
         cln_api::event::Event::SystemBlockAdded(b) => {
             println!("{} BlockAdded: height={}", ts(b.timestamp), b.block_height);
