@@ -7,9 +7,7 @@ use crate::cln::cln_api;
 use crate::cln::cln_api::node_services_server::NodeServices;
 use crate::domain::info::getinfo::get_info;
 use crate::domain::invoice::{create, xpay};
-use crate::grpc::interceptors::auth::{
-    extract_client_id, extract_rune_from_request, validate_rune, CLIENT_ID_HEADER, RUNE_HEADER,
-};
+use crate::grpc::interceptors::auth::{extract_client_id, CLIENT_ID_HEADER};
 use crate::grpc::interceptors::rate_limiter::check_rate_limit;
 
 use super::server::ApiService;
@@ -26,16 +24,7 @@ impl NodeServices for ApiService {
         &self,
         request: Request<cln_api::InvoiceRequest>,
     ) -> Result<Response<cln_api::InvoiceResponse>, Status> {
-        let rune = extract_rune_from_request(&request).ok_or_else(|| {
-            Status::unauthenticated(format!(
-                "Missing or empty Rune header '{}'. Provide a valid Rune for authentication.",
-                RUNE_HEADER
-            ))
-        })?;
-
-        validate_rune(&self.client, &rune, "invoice").await?;
-        tracing::info!("Rune validated - allowing invoice request through");
-
+        // Rate limiting (rune already validated by AuthLayer)
         let client_id = extract_client_id(&request).ok_or_else(|| {
             Status::invalid_argument(format!("Missing or invalid '{}' header", CLIENT_ID_HEADER))
         })?;
@@ -63,16 +52,7 @@ impl NodeServices for ApiService {
         &self,
         request: Request<cln_api::GetinfoRequest>,
     ) -> Result<Response<cln_api::GetinfoResponse>, Status> {
-        let rune = extract_rune_from_request(&request).ok_or_else(|| {
-            Status::unauthenticated(format!(
-                "Missing or empty Rune header '{}'. Provide a valid Rune for authentication.",
-                RUNE_HEADER
-            ))
-        })?;
-
-        validate_rune(&self.client, &rune, "getinfo").await?;
-        tracing::info!("Rune validated - allowing getinfo request through");
-
+        // Rune already validated by AuthLayer
         let c = self.client.as_ref();
         get_info(c, request).await
     }
@@ -81,16 +61,7 @@ impl NodeServices for ApiService {
         &self,
         request: Request<cln_api::XpayRequest>,
     ) -> Result<Response<cln_api::XpayResponse>, Status> {
-        let rune = extract_rune_from_request(&request).ok_or_else(|| {
-            Status::unauthenticated(format!(
-                "Missing or empty Rune header '{}'. Provide a valid Rune for authentication.",
-                RUNE_HEADER
-            ))
-        })?;
-
-        validate_rune(&self.client, &rune, "xpay").await?;
-        tracing::info!("Rune validated - allowing xpay request through");
-
+        // Rune already validated by AuthLayer
         let c = self.client.as_ref();
         xpay::xpay(c, request).await
     }
@@ -103,16 +74,7 @@ impl NodeServices for ApiService {
         &self,
         request: Request<cln_api::InvoiceRequest>,
     ) -> Result<Response<Self::InvoiceStreamStream>, Status> {
-        // 1. Auth + Rate limit (mismo que invoice())
-        let rune = extract_rune_from_request(&request).ok_or_else(|| {
-            Status::unauthenticated(format!(
-                "Missing or empty Rune header '{}'. Provide a valid Rune for authentication.",
-                RUNE_HEADER
-            ))
-        })?;
-        validate_rune(&self.client, &rune, "invoice").await?;
-        tracing::info!("Rune validated - allowing invoice_stream request through");
-
+        // Rate limiting (rune already validated by AuthLayer)
         let client_id = extract_client_id(&request).ok_or_else(|| {
             Status::invalid_argument(format!("Missing or invalid '{}' header", CLIENT_ID_HEADER))
         })?;
@@ -244,15 +206,7 @@ impl NodeServices for ApiService {
         &self,
         request: Request<cln_api::XpayRequest>,
     ) -> Result<Response<Self::XpayStreamWatchStream>, Status> {
-        // 1. Auth (mismo que xpay())
-        let rune = extract_rune_from_request(&request).ok_or_else(|| {
-            Status::unauthenticated(format!(
-                "Missing or empty Rune header '{}'. Provide a valid Rune for authentication.",
-                RUNE_HEADER
-            ))
-        })?;
-        validate_rune(&self.client, &rune, "xpay").await?;
-        tracing::info!("Rune validated - allowing xpay_stream_watch request through");
+        // Rune already validated by AuthLayer
 
         // 2. Llamar CLN xpay()
         let cln_response = xpay::xpay(&self.client, request).await?;
@@ -336,16 +290,9 @@ impl NodeServices for ApiService {
 
     async fn xpay_stream(
         &self,
-        request: Request<()>,
+        _request: Request<()>,
     ) -> Result<Response<Self::XpayStreamStream>, Status> {
-        let rune = extract_rune_from_request(&request).ok_or_else(|| {
-            Status::unauthenticated(format!(
-                "Missing or empty Rune header '{}'. Provide a valid Rune for authentication.",
-                RUNE_HEADER
-            ))
-        })?;
-        validate_rune(&self.client, &rune, "xpay_stream").await?;
-        tracing::info!("Rune validated - allowing xpay_stream request through");
+        // Rune already validated by AuthLayer
 
         let (internal_tx, mut internal_rx) =
             tokio::sync::mpsc::channel::<crate::events::types::Event>(64);
@@ -384,16 +331,9 @@ impl NodeServices for ApiService {
 
     async fn invoice_watch(
         &self,
-        request: Request<()>,
+        _request: Request<()>,
     ) -> Result<Response<Self::InvoiceWatchStream>, Status> {
-        let rune = extract_rune_from_request(&request).ok_or_else(|| {
-            Status::unauthenticated(format!(
-                "Missing or empty Rune header '{}'. Provide a valid Rune for authentication.",
-                RUNE_HEADER
-            ))
-        })?;
-        validate_rune(&self.client, &rune, "invoice_watch").await?;
-        tracing::info!("Rune validated - allowing invoice_watch request through");
+        // Rune already validated by AuthLayer
 
         let (internal_tx, mut internal_rx) =
             tokio::sync::mpsc::channel::<crate::events::types::Event>(64);
@@ -430,16 +370,9 @@ impl NodeServices for ApiService {
 
     async fn watch_channels(
         &self,
-        request: Request<()>,
+        _request: Request<()>,
     ) -> Result<Response<Self::WatchChannelsStream>, Status> {
-        let rune = extract_rune_from_request(&request).ok_or_else(|| {
-            Status::unauthenticated(format!(
-                "Missing or empty Rune header '{}'. Provide a valid Rune for authentication.",
-                RUNE_HEADER
-            ))
-        })?;
-        validate_rune(&self.client, &rune, "watch_channels").await?;
-        tracing::info!("Rune validated - allowing watch_channels request through");
+        // Rune already validated by AuthLayer
 
         let (internal_tx, mut internal_rx) =
             tokio::sync::mpsc::channel::<crate::events::types::Event>(64);
@@ -476,16 +409,9 @@ impl NodeServices for ApiService {
 
     async fn watch_peers(
         &self,
-        request: Request<()>,
+        _request: Request<()>,
     ) -> Result<Response<Self::WatchPeersStream>, Status> {
-        let rune = extract_rune_from_request(&request).ok_or_else(|| {
-            Status::unauthenticated(format!(
-                "Missing or empty Rune header '{}'. Provide a valid Rune for authentication.",
-                RUNE_HEADER
-            ))
-        })?;
-        validate_rune(&self.client, &rune, "watch_peers").await?;
-        tracing::info!("Rune validated - allowing watch_peers request through");
+        // Rune already validated by AuthLayer
 
         let (internal_tx, mut internal_rx) =
             tokio::sync::mpsc::channel::<crate::events::types::Event>(64);
@@ -522,16 +448,9 @@ impl NodeServices for ApiService {
 
     async fn watch_system(
         &self,
-        request: Request<()>,
+        _request: Request<()>,
     ) -> Result<Response<Self::WatchSystemStream>, Status> {
-        let rune = extract_rune_from_request(&request).ok_or_else(|| {
-            Status::unauthenticated(format!(
-                "Missing or empty Rune header '{}'. Provide a valid Rune for authentication.",
-                RUNE_HEADER
-            ))
-        })?;
-        validate_rune(&self.client, &rune, "watch_system").await?;
-        tracing::info!("Rune validated - allowing watch_system request through");
+        // Rune already validated by AuthLayer
 
         let (internal_tx, mut internal_rx) =
             tokio::sync::mpsc::channel::<crate::events::types::Event>(64);

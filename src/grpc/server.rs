@@ -9,6 +9,7 @@ use crate::cln::client::ClnClient;
 use crate::cln::cln_api::node_services_server::NodeServicesServer;
 use crate::events::router::EventRouter;
 use crate::events::subscribers::ClnEventBridge;
+use crate::grpc::interceptors::auth_layer::AuthLayer;
 
 pub struct ApiService {
     pub client: Arc<ClnClient>,
@@ -65,8 +66,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("gRPC API server listening on {}", addr);
 
+    let auth_layer = AuthLayer::new(api_service.client.clone());
+
     Server::builder()
         .tls_config(tls_config)?
+        .layer(auth_layer)
         .add_service(NodeServicesServer::new(api_service))
         .serve_with_shutdown(addr, shutdown_signal(bridge_handle))
         .await?;
