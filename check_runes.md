@@ -69,7 +69,8 @@ Client Request
 | `src/grpc/interceptors/auth.rs` | +27 tests (19 original + 6 rune alteration/format + 2 whitespace) |
 | `src/grpc/interceptors/auth_layer.rs` | **NEW**: tower Layer + Service middleware |
 | `src/grpc/interceptors/mod.rs` | +`auth_layer` module |
-| `src/grpc/server.rs` | +`.layer(auth_layer)` |
+| `src/grpc/interceptors/rate_limiter.rs` | +`InMemoryRateLimiter`, +`check_rate_limit_with_fallback`, +5 tests |
+| `src/grpc/server.rs` | +`.layer(auth_layer)`, +`in_memory_limiter`, +cleanup task |
 
 ---
 
@@ -136,7 +137,7 @@ The fix: Always create runes with restrictions using `lightning-cli createrune -
 
 | # | Task | Status | Notes |
 |---|------|--------|-------|
-| 1 | **Rate limit fallback when Valkey is down** (M-2) | NOT DONE | Currently silently allows all requests when Redis unavailable. Need in-memory token bucket fallback. |
+| 1 | **Rate limit fallback when Valkey is down** (M-2) | **DONE** (commit pending) | `InMemoryRateLimiter` with token bucket fallback. Falls back when Redis unavailable. |
 | 2 | **Pass params to `check_rune`** (H-2) | **DONE** (commit `5c5c17d`) | `extract_params_for_path()` decodes protobuf and passes params to `validate_rune`. |
 | 3 | **Verify rune alteration actually fails** | **DONE** (tests added) | 6 tests added: alteration preservation, HMAC difference, base64 format, restrictions format, empty/whitespace. CLN `check_rune` validates HMAC — alteration causes `valid: false`. |
 
@@ -166,7 +167,7 @@ The fix: Always create runes with restrictions using `lightning-cli createrune -
 | H-1 | No tonic interceptor, auth was manual | HIGH | **FIXED** (commit `da60e16`) |
 | H-2 | Rune `params` restrictions bypassed | HIGH | **FIXED** (commit `5c5c17d`) |
 | M-1 | Rune `nodeid` not verified | MEDIUM | **NOT DONE** |
-| M-2 | Rate limiter bypassed when Valkey down | MEDIUM | **NOT DONE** |
+| M-2 | Rate limiter bypassed when Valkey down | MEDIUM | **FIXED** (commit pending) |
 | L-1 | 5 watch RPCs also lack rate limiting | LOW | **NOT DONE** (low priority) |
 
 ---
@@ -174,9 +175,10 @@ The fix: Always create runes with restrictions using `lightning-cli createrune -
 ## Test Coverage
 
 ```
-72 tests passing:
+77 tests passing:
   - 27 auth.rs tests (extract_rune, extract_client_id, patterns, rune alteration, rune format)
   - 9 auth_layer.rs tests (method mapping, paths, constants, param extraction)
+  - 5 rate_limiter.rs tests (in-memory token bucket: allow, reject, refill, independent, cleanup)
   - 36 existing project tests (events, certs, router, security)
 ```
 

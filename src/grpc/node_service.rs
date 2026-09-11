@@ -8,7 +8,7 @@ use crate::cln::cln_api::node_services_server::NodeServices;
 use crate::domain::info::getinfo::get_info;
 use crate::domain::invoice::{create, xpay};
 use crate::grpc::interceptors::auth::{extract_client_id, CLIENT_ID_HEADER};
-use crate::grpc::interceptors::rate_limiter::check_rate_limit;
+use crate::grpc::interceptors::rate_limiter::check_rate_limit_with_fallback;
 
 use super::server::ApiService;
 
@@ -29,15 +29,12 @@ impl NodeServices for ApiService {
             Status::invalid_argument(format!("Missing or invalid '{}' header", CLIENT_ID_HEADER))
         })?;
 
-        let allowed = match &self.redis_cm {
-            Some(cm) => check_rate_limit(cm, &client_id)
-                .await
-                .map_err(|_| Status::unavailable("Rate limiter unavailable"))?,
-            None => {
-                tracing::warn!("Valkey not connected - rate limiting skipped");
-                true
-            }
-        };
+        let allowed = check_rate_limit_with_fallback(
+            &self.redis_cm,
+            &self.in_memory_limiter,
+            &client_id,
+        )
+        .await;
 
         if !allowed {
             return Err(Status::resource_exhausted(
@@ -78,15 +75,12 @@ impl NodeServices for ApiService {
         let client_id = extract_client_id(&request).ok_or_else(|| {
             Status::invalid_argument(format!("Missing or invalid '{}' header", CLIENT_ID_HEADER))
         })?;
-        let allowed = match &self.redis_cm {
-            Some(cm) => check_rate_limit(cm, &client_id)
-                .await
-                .map_err(|_| Status::unavailable("Rate limiter unavailable"))?,
-            None => {
-                tracing::warn!("Valkey not connected - rate limiting skipped");
-                true
-            }
-        };
+        let allowed = check_rate_limit_with_fallback(
+            &self.redis_cm,
+            &self.in_memory_limiter,
+            &client_id,
+        )
+        .await;
         if !allowed {
             return Err(Status::resource_exhausted(
                 "Rate limit exceeded: maximum 3 invoices per hour",
