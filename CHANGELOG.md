@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.5.0] - 2026-09-11
+
+Client/server role separation.
+
+### Added
+- `gcob-client init`: local CSR generation (`--client-hostname`, `--client-ip`,
+  `--output`, `--force`, `--no-confirm`) without certificates or a server
+  connection
+- `GCOB_ROLE=client|server|auto` for the `gcob` administration CLI; `auto` uses
+  `GRPC_BIND_ADDR` plus a secure `/etc/haproxy/certs`
+- Server-only commands (`serve`, `sign`, `certs renew`) are denied in client
+  role with an actionable message
+- `gcob-client init --help` shows only the local CSR options
+
+### Changed
+- `gcob` is server-only: client flags are hidden from `init --help`
+- `gcob init --client` is deprecated (still functional) in favor of
+  `gcob-client init`
+- `gcob-client` help now identifies itself as `gcob-client`
+- Client CSR generation moved to the shared library (`gcob::client_init`)
+
 ## [0.4.3] - 2026-09-11
 
 Security hardening across the CLI, `init --server`, `sign` and `certs renew`.

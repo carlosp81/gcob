@@ -1,6 +1,6 @@
 [package]
 name = "gcob"
-version = "0.4.3"
+version = "0.5.0"
 edition = "2021"
 description = "Lightweight gRPC API for Core Lightning nodes"
 license = "MIT OR Apache-2.0"
