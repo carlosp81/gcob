@@ -10,6 +10,7 @@ static RUNE_LOGGED: AtomicBool = AtomicBool::new(false);
 pub(crate) const RUNE_HEADER: &str = "x-rune";
 pub(crate) const CLIENT_ID_HEADER: &str = "x-client-id";
 
+#[cfg(test)]
 pub(crate) fn extract_rune_from_request<T>(request: &Request<T>) -> Option<String> {
     request
         .metadata()

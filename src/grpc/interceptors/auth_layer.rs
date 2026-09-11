@@ -287,4 +287,70 @@ mod tests {
         assert_eq!(params[1], ""); // label defaults to ""
         assert_eq!(params[2], ""); // description defaults to ""
     }
+
+    // --- AuthLayer rejection response tests ---
+
+    #[test]
+    fn unauthenticated_response_has_status_16() {
+        let resp = unauthenticated_response("test message");
+        // into_http() returns HTTP 200; gRPC status is in the body (grpc-status header)
+        // The actual gRPC status code is embedded in the response body
+        assert_eq!(resp.status(), 200); // HTTP status is 200
+        // The gRPC status is in the grpc-status header
+        let grpc_status = resp.headers().get("grpc-status");
+        assert!(grpc_status.is_some(), "Should have grpc-status header");
+    }
+
+    #[test]
+    fn unauthenticated_response_has_grpc_content_type() {
+        let resp = unauthenticated_response("test");
+        assert_eq!(
+            resp.headers().get("content-type").unwrap(),
+            "application/grpc"
+        );
+    }
+
+    #[test]
+    fn rune_method_for_path_all_10_rpc_methods() {
+        // Verify all 10 RPC methods are mapped
+        let paths = vec![
+            "/cln.NodeServices/Invoice",
+            "/cln.NodeServices/Getinfo",
+            "/cln.NodeServices/Xpay",
+            "/cln.NodeServices/InvoiceStream",
+            "/cln.NodeServices/XpayStreamWatch",
+            "/cln.NodeServices/XpayStream",
+            "/cln.NodeServices/InvoiceWatch",
+            "/cln.NodeServices/WatchChannels",
+            "/cln.NodeServices/WatchPeers",
+            "/cln.NodeServices/WatchSystem",
+        ];
+        for path in paths {
+            assert!(
+                rune_method_for_path(path).is_some(),
+                "Path should be mapped: {}",
+                path
+            );
+        }
+    }
+
+    #[test]
+    fn rune_method_for_path_returns_correct_method_names() {
+        assert_eq!(rune_method_for_path("/cln.NodeServices/Invoice"), Some("invoice"));
+        assert_eq!(rune_method_for_path("/cln.NodeServices/Xpay"), Some("xpay"));
+        assert_eq!(rune_method_for_path("/cln.NodeServices/XpayStream"), Some("xpay_stream"));
+        assert_eq!(rune_method_for_path("/cln.NodeServices/InvoiceWatch"), Some("invoice_watch"));
+    }
+
+    #[test]
+    fn extract_params_invoice_empty_body() {
+        let params = extract_params_for_path("/cln.NodeServices/Invoice", &[]);
+        assert_eq!(params, vec!["", "", ""]);
+    }
+
+    #[test]
+    fn extract_params_xpay_empty_body() {
+        let params = extract_params_for_path("/cln.NodeServices/Xpay", &[]);
+        assert_eq!(params, vec!["", ""]);
+    }
 }

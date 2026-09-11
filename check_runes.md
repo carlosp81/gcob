@@ -147,7 +147,7 @@ The fix: Always create runes with restrictions using `lightning-cli createrune -
 | # | Task | Status | Notes |
 |---|------|--------|-------|
 | 4 | **Pass nodeid to `check_rune`** (M-1) | **DONE** (commit pending) | `ClnClient` caches node ID from `getinfo`. `validate_rune` now sends `nodeid: Some(client.node_id.clone())`. |
-| 5 | **Remove dead code: `extract_rune_from_request`** | NOT DONE | Now unused in production code (only used in tests). Either make `#[cfg(test)]` or remove. |
+| 5 | **Remove dead code: `extract_rune_from_request`** | **DONE** | Marked as `#[cfg(test)]`. |
 | 6 | **Update v0.4.1 changelog and tag** | NOT DONE | Need to add security fixes to changelog and create new tag. |
 
 ### Priority 3: Medium
@@ -176,9 +176,9 @@ The fix: Always create runes with restrictions using `lightning-cli createrune -
 ## Test Coverage
 
 ```
-77 tests passing:
+83 tests passing:
   - 27 auth.rs tests (extract_rune, extract_client_id, patterns, rune alteration, rune format)
-  - 9 auth_layer.rs tests (method mapping, paths, constants, param extraction)
+  - 15 auth_layer.rs tests (method mapping, paths, constants, param extraction, rejection responses)
   - 5 rate_limiter.rs tests (in-memory token bucket: allow, reject, refill, independent, cleanup)
   - 36 existing project tests (events, certs, router, security)
 ```

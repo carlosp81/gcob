@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.4.2] - 2026-09-11
+
+### Fixed
+- **SECURITY**: Centralize rune auth via tower AuthLayer middleware (was per-handler, could be forgotten)
+- **SECURITY**: Add rune auth to 5 streaming RPCs (xpay_stream, invoice_watch, watch_channels, watch_peers, watch_system)
+- **SECURITY**: Pass request params to check_rune for rune restriction enforcement (params=amount_msat<100000 now enforced)
+- **SECURITY**: Pass nodeid to check_rune for rune ownership verification (rejects runes from other nodes)
+- **SECURITY**: Add in-memory rate limiter fallback when Valkey is unavailable (prevents silent rate limit bypass)
+
+### Added
+- `AuthLayer` tower middleware: validates rune for ALL gRPC handlers at HTTP layer
+- `InMemoryRateLimiter`: token bucket fallback (3 requests/hour per client_id) when Redis is down
+- `extract_params_for_path()`: decode protobuf body and pass params to check_rune
+- 77 unit tests (auth, auth_layer, rate_limiter, events, certs, router, security)
+- Rune alteration verification tests (6 tests for HMAC validation)
+
+### Changed
+- Remove 99 lines of manual auth boilerplate from node_service.rs
+- Remove dead code: `extract_rune_from_request` marked as `#[cfg(test)]`
+- Specialize AuthLayer Service impl for `tonic::body::Body`
+
 ## [0.4.1] - 2026-09-10
 
 ### Fixed
