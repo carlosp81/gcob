@@ -32,22 +32,79 @@ Bakog is a high-performance, secure gRPC API designed for Core Lightning (CLN) n
 cargo build --release
 ```
 
+### Server provisioning (init --server)
+
+Provisions HAProxy and API certificates from the CLN CA. Requires root (or
+write access to `/etc/haproxy/certs`) and explicit flags:
+
+```bash
+sudo gcob init --server \
+    --cln-dir /home/lightning/.lightning/bitcoin \
+    --server-hostname node.example --server-ip 10.0.0.5
+```
+
+- `--cln-dir` is mandatory: it must contain `ca.pem` and `ca-key.pem`.
+- The CA must be `CA:TRUE`, its private key must match, and its SHA-256
+  fingerprint is pinned; changing it requires `--rotate-ca`.
+- Existing files are never overwritten without `--force`.
+- `--dry-run` validates and stages without writing anything.
+- Outputs: HAProxy bundles (`root:haproxy`, 0640) and the API directory
+  (`api-user`, keys 0600) including its own `client.pem`/`client-key.pem`.
+
+### Sign client certificates (`gcob sign`)
+
+Signs a CSR with the validated CLN CA. All flags are explicit; the output
+directory is mandatory (never defaults to the service directory):
+
+```bash
+sudo gcob sign \
+    --csr /tmp/client.csr \
+    --hostname client.example \
+    --cln-dir /home/lightning/.lightning/bitcoin \
+    --output /tmp/signed
+```
+
+- `--cln-dir` must contain the `CA:TRUE` `ca.pem` and its matching `ca-key.pem`.
+- `--expected-ca-fingerprint <HEX>` pins the signing CA (recommended in
+  automated flows).
+- Wildcards and invalid hostnames are rejected.
+- The CSR must be a regular file ≤1 MiB (no symlinks).
+- An existing `client.pem` requires `--force`; `--dry-run` stages and verifies
+  without publishing.
+
+### Renew API certificates (`gcob certs renew`)
+
+```bash
+sudo gcob certs renew \
+    --cln-dir /home/lightning/.lightning/bitcoin \
+    --api-user gcob
+```
+
+- Renewal verifies the new leaves against the **installed** `ca.pem`.
+- If `~/.certs/ca.pem` is missing, `--init-ca` is required to install it.
+- A CA whose fingerprint differs from the installed one requires `--rotate-ca`.
+- Publication is atomic with backups (`.bak.<epoch>`) and rollback; existing
+  files are always backed up before replacement.
+- `--server-hostname`/`--server-ip` override the identity; otherwise the SANs of
+  the current `server.pem` are reused and validated.
+
 ### Run
 
 ```bash
 # As service user (recommended)
-sudo -u gcob /usr/local/bin/gcob
+sudo -u gcob /usr/local/bin/gcob serve
 
 # Or directly (development)
-cargo run
+cargo run -- serve
 ```
 
 ### Sudoers Configuration
 
-Add to `/etc/sudoers.d/gcob`:
+Add to `/etc/sudoers.d/gcob` (do **not** grant `grpcurl`: it bypasses the API
+rune layer by talking to CLN directly with the service identity):
 
 ```
-user-admin ALL=(gcob) NOPASSWD: /usr/local/bin/gcob, /usr/bin/grpcurl
+user-admin ALL=(gcob) NOPASSWD: /usr/local/bin/gcob
 ```
 
 ### Test with grpcurl
