@@ -32,6 +32,32 @@ Bakog is a high-performance, secure gRPC API designed for Core Lightning (CLN) n
 cargo build --release
 ```
 
+### Deployment roles
+
+Two binaries are built:
+
+- **`gcob`** — server administration: `init --server`, `serve`, `sign`, `certs`.
+- **`gcob-client`** — client hosts: `init` (CSR generation), `info`, `invoice`,
+  `xpay`, `watch`.
+
+Role resolution for `gcob`:
+
+| `GCOB_ROLE` | Behavior |
+|-------------|----------|
+| unset / `auto` | `server` when `GRPC_BIND_ADDR` is set and `/etc/haproxy/certs` is a secure directory; otherwise `client` |
+| `client` | `serve`, `sign` and `certs renew` are denied with a clear message |
+| `server` | server commands allowed (use on hosts where auto-detection is inconclusive) |
+
+`gcob init --server` is exempt because it is the bootstrap command. Client CSR
+generation now runs locally on the client host:
+
+```bash
+gcob-client init --client-hostname client.example --client-ip 10.0.0.5
+```
+
+`gcob init --client` still works for compatibility but is deprecated, hidden
+from `init --help`, and will be removed in a future release.
+
 ### Server provisioning (init --server)
 
 Provisions HAProxy and API certificates from the CLN CA. Requires root (or
