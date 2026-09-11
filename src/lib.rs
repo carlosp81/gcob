@@ -1,4 +1,5 @@
 pub mod certs;
+pub mod client_init;
 pub mod cln;
 pub mod config;
 pub mod domain;

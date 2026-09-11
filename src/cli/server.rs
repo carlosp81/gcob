@@ -1,11 +1,8 @@
 use std::path::PathBuf;
 
 use crate::certs::detect;
-use crate::certs::generate::{self, CertError};
-use crate::certs::paths::{
-    check_gcob_access, chown_recursive, detect_admin_account, ensure_cert_dir, setup_gcob_acls,
-    ClientPaths,
-};
+use crate::certs::generate::CertError;
+use crate::certs::paths::{check_gcob_access, ClientPaths};
 
 use super::provision::{self, InitServerRequest};
 
@@ -36,38 +33,17 @@ pub fn handle_init_client(
     // Validate user has permission to manage certificates
     check_gcob_access()?;
 
-    // Resolve identity: CLI flag > env var > auto-detect > default
-    let identity = detect::resolve_identity(
-        client_hostname,
-        client_ip,
-        "CLIENT_HOSTNAME",
-        "CLIENT_IP",
-        "localhost",
-        "127.0.0.1",
-        false, // IP optional for client
-    )?;
-    let client_hostname = identity.hostname;
-    let client_ip = identity.ip;
-
-    // Always use the canonical path (~/.certs)
-    let client_paths = ClientPaths::default_path()?;
-
-    // Check if CSR already exists
-    let csr_path = client_paths.cert_dir.join("client.csr");
-    if csr_path.exists() && !force {
-        eprintln!("Error: CSR already exists at {}", csr_path.display());
-        eprintln!("  Use --force to regenerate (will overwrite existing CSR)");
-        std::process::exit(1);
-    }
+    let plan = gcob::client_init::plan(client_hostname, client_ip, None)?;
+    let csr_path = plan.cert_dir.join("client.csr");
 
     // Show configuration and ask for confirmation
     println!("=== Initializing gcob client (CSR generation) ===");
     println!();
-    println!("  Hostname: {}", client_hostname);
-    if let Some(ref ip) = client_ip {
+    println!("  Hostname: {}", plan.hostname);
+    if let Some(ref ip) = plan.ip {
         println!("  IP:       {}", ip);
     }
-    println!("  Output:   {}", client_paths.cert_dir.display());
+    println!("  Output:   {}", plan.cert_dir.display());
     if force && csr_path.exists() {
         println!("  Mode:     Overwrite existing CSR");
     }
@@ -90,41 +66,10 @@ pub fn handle_init_client(
         println!();
     }
 
-    // Ensure certificate directory exists
-    ensure_cert_dir()?;
-
-    // Step 1: Ensure directory exists
-    println!("[1/4] Ensuring certificate directory...");
-
-    // Step 2: Generate CSR
-    println!("[2/4] Generating CSR...");
-    generate::generate_csr(
-        &client_hostname,
-        client_ip.as_deref(),
-        &client_paths.cert_dir,
-    )?;
-    println!("[3/4] CSR generated successfully");
-
-    // Step 3: Set permissions, ownership and ACLs
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        // Key: only owner can read
-        std::fs::set_permissions(
-            &client_paths.client_key_file,
-            std::fs::Permissions::from_mode(0o400),
-        )?;
-        // CSR: readable by all
-        std::fs::set_permissions(
-            client_paths.cert_dir.join("client.csr"),
-            std::fs::Permissions::from_mode(0o444),
-        )?;
-        // Ownership to the admin account (never an unrelated account)
-        let account = detect_admin_account()?;
-        chown_recursive(&client_paths.cert_dir, account.uid, account.gid)?;
-        // ACLs for gcob access
-        setup_gcob_acls()?;
-    }
+    println!("[1/3] Ensuring certificate directory...");
+    println!("[2/3] Generating CSR...");
+    gcob::client_init::run(&plan, force, true)?;
+    println!("[3/3] CSR generated successfully");
 
     println!();
     println!("=== CSR generated successfully ===");
@@ -132,28 +77,28 @@ pub fn handle_init_client(
     println!("Files:");
     println!(
         "  {}/client.csr      (send to server)",
-        client_paths.cert_dir.display()
+        plan.cert_dir.display()
     );
     println!(
         "  {}/client-key.pem  (keep secret)",
-        client_paths.cert_dir.display()
+        plan.cert_dir.display()
     );
     println!();
     println!("Next steps:");
     println!("  1. Send client.csr to the server:");
     println!(
         "     scp {}/client.csr user@server:/tmp/",
-        client_paths.cert_dir.display()
+        plan.cert_dir.display()
     );
     println!();
     println!("  2. On the server, sign the CSR:");
     println!(
         "     gcob sign --csr /tmp/client.csr --hostname {}",
-        client_hostname
+        plan.hostname
     );
     println!();
     println!("  3. Server will return: ca.pem + client.pem");
-    println!("     Place them in: {}/", client_paths.cert_dir.display());
+    println!("     Place them in: {}/", plan.cert_dir.display());
 
     Ok(())
 }
