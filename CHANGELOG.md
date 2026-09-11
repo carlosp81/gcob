@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.4.1] - 2026-09-10
+
+### Fixed
+- Add missing `x-rune` header to `info` command (was causing authentication failure)
+- Add missing `x-client-id` header to `invoice` and `xpay` commands (required by server rate limiter)
+
+### Added
+- `--client-id` / `GCOD_CLIENT_ID` global CLI argument for rate limiting identification
+- `--expiry` / `-e` CLI argument for invoice command (invoice expiry in seconds)
+- `expiry` field in `InvoiceCreated` proto message
+- Expiry display in invoice command output
+
 ## [0.3.5] - 2026-09-10
 
 ### Changed
