@@ -1,9 +1,40 @@
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::certs::inspect;
-use crate::certs::paths::{check_gcob_access, default_cert_dir, is_server_env, ClnSourcePaths, ServerPaths};
+use super::atomic::{publish_files, PlannedFile, PublishedFile};
 use super::VerifySubcommand;
+use crate::certs::detect;
+use crate::certs::generate::{self, CertError};
+use crate::certs::inspect;
+use crate::certs::paths::{
+    account_by_name, check_gcob_access, current_account, default_cert_dir, detect_admin_account,
+    ensure_secure_dir, is_server_env, lock_dir, ClnSourcePaths, ServerPaths,
+};
+
+/// Arguments for `gcob certs renew`.
+pub struct RenewArgs {
+    pub force: bool,
+    pub server_hostname: Option<String>,
+    pub server_ip: Option<String>,
+    pub cln_dir: PathBuf,
+    pub init_ca: bool,
+    pub rotate_ca: bool,
+    pub api_user: String,
+    pub allow_loopback: bool,
+    pub dry_run: bool,
+}
+
+/// Arguments for `gcob sign`.
+pub struct SignArgs {
+    pub csr: PathBuf,
+    pub hostname: String,
+    pub cln_dir: PathBuf,
+    pub output: PathBuf,
+    pub force: bool,
+    pub dry_run: bool,
+    pub expected_ca_fingerprint: Option<String>,
+}
 
 /// Handle `gcob certs` (no subcommand) — show usage help
 pub fn handle_no_subcommand() {
@@ -44,7 +75,7 @@ pub fn handle_list(server: bool) {
     }
 
     // Client Certificates — always shown
-    let client_dir = default_cert_dir();
+    let client_dir = resolve_cert_dir();
     print_cert_status(
         "Client Certificates:",
         &client_dir,
@@ -217,7 +248,7 @@ fn verify_api_section(cert_dir: &Path, _hostname: &str) -> Vec<bool> {
                 } else {
                     println!("        Status:  ✗ Not a CA certificate");
                 }
-                results.push(true);
+                results.push(info.is_ca);
             }
             Err(e) => {
                 println!("  ca.pem: ✗ Parse error: {}", e);
@@ -239,12 +270,12 @@ fn verify_haproxy_section(haproxy_dir: &Path, client_cert_dir: &Path, hostname: 
     // 1. ca-certs/ca.pem
     let ca_path = ca_dir.join("ca.pem");
     if !ca_path.exists() {
-        println!("  [1/4] ca-certs/ca.pem: ✗ Not found");
+        println!("  [1/3] ca-certs/ca.pem: ✗ Not found");
         results.push(false);
     } else {
         match inspect::parse_cert(&ca_path) {
             Ok(info) => {
-                println!("  [1/4] ca-certs/ca.pem");
+                println!("  [1/3] ca-certs/ca.pem");
                 println!("        Subject: {}", info.subject);
                 println!("        Is CA:   {}", info.is_ca);
                 if info.is_ca {
@@ -261,7 +292,10 @@ fn verify_haproxy_section(haproxy_dir: &Path, client_cert_dir: &Path, hostname: 
                             if a == b {
                                 println!("        Compare: ✓ Matches {}", client_ca.display());
                             } else {
-                                println!("        Compare: ✗ Does NOT match {}", client_ca.display());
+                                println!(
+                                    "        Compare: ✗ Does NOT match {}",
+                                    client_ca.display()
+                                );
                             }
                         }
                         _ => {
@@ -269,58 +303,24 @@ fn verify_haproxy_section(haproxy_dir: &Path, client_cert_dir: &Path, hostname: 
                         }
                     }
                 }
-                results.push(true);
+                results.push(info.is_ca);
             }
             Err(e) => {
-                println!("  [1/4] ca-certs/ca.pem: ✗ Parse error: {}", e);
+                println!("  [1/3] ca-certs/ca.pem: ✗ Parse error: {}", e);
                 results.push(false);
             }
         }
     }
 
-    // 2. ca-certs/ca-key.pem
-    let ca_key_path = ca_dir.join("ca-key.pem");
-    if !ca_key_path.exists() {
-        println!("\n  [2/4] ca-certs/ca-key.pem: ✗ Not found");
-        results.push(false);
-    } else {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            match fs::metadata(&ca_key_path) {
-                Ok(meta) => {
-                    let mode = meta.permissions().mode() & 0o777;
-                    println!("\n  [2/4] ca-certs/ca-key.pem");
-                    if mode == 0o400 {
-                        println!("        Permissions: ✓ 0400 (read-only)");
-                        results.push(true);
-                    } else {
-                        println!("        Permissions: ✗ {:04o} (expected 0400)", mode);
-                        results.push(false);
-                    }
-                }
-                Err(e) => {
-                    println!("\n  [2/4] ca-certs/ca-key.pem: ✗ {}", e);
-                    results.push(false);
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            println!("\n  [2/4] ca-certs/ca-key.pem: ✓ Exists");
-            results.push(true);
-        }
-    }
-
-    // 3. cert_server_concat.pem
+    // 2. cert_server_concat.pem
     let server_concat_path = haproxy_dir.join("cert_server_concat.pem");
     if !server_concat_path.exists() {
-        println!("\n  [3/4] cert_server_concat.pem: ✗ Not found");
+        println!("\n  [2/3] cert_server_concat.pem: ✗ Not found");
         results.push(false);
     } else {
         match inspect::verify_signed_by(&server_concat_path, &ca_path) {
             Ok(result) => {
-                println!("\n  [3/4] cert_server_concat.pem");
+                println!("\n  [2/3] cert_server_concat.pem");
                 println!("        Subject: {}", result.subject);
                 println!("        Issuer:  {}", result.issuer);
 
@@ -334,22 +334,25 @@ fn verify_haproxy_section(haproxy_dir: &Path, client_cert_dir: &Path, hostname: 
                 }
 
                 if result.expired {
-                    println!("        Expiry:  ✗ Expired ({} days ago)", -result.days_remaining);
+                    println!(
+                        "        Expiry:  ✗ Expired ({} days ago)",
+                        -result.days_remaining
+                    );
                 } else {
-                    println!("        Expiry:  ✓ Valid ({} days remaining)", result.days_remaining);
+                    println!(
+                        "        Expiry:  ✓ Valid ({} days remaining)",
+                        result.days_remaining
+                    );
                 }
 
                 // Show SANs
-                match inspect::parse_cert(&server_concat_path) {
-                    Ok(info) => {
-                        if !info.sans.is_empty() {
-                            println!("        SANs:");
-                            for san in &info.sans {
-                                println!("          - {}", san);
-                            }
+                if let Ok(info) = inspect::parse_cert(&server_concat_path) {
+                    if !info.sans.is_empty() {
+                        println!("        SANs:");
+                        for san in &info.sans {
+                            println!("          - {}", san);
                         }
                     }
-                    Err(_) => {}
                 }
 
                 // SAN check
@@ -358,10 +361,10 @@ fn verify_haproxy_section(haproxy_dir: &Path, client_cert_dir: &Path, hostname: 
                     Ok(false) => println!("        SAN Check: ✗ Does NOT match '{}'", hostname),
                     Err(e) => println!("        SAN Check: ✗ Error: {}", e),
                 }
-                results.push(true);
+                results.push(result.signed_by_ca && !result.expired);
             }
             Err(e) => {
-                println!("\n  [3/4] cert_server_concat.pem: ✗ Error: {}", e);
+                println!("\n  [2/3] cert_server_concat.pem: ✗ Error: {}", e);
                 results.push(false);
             }
         }
@@ -370,12 +373,12 @@ fn verify_haproxy_section(haproxy_dir: &Path, client_cert_dir: &Path, hostname: 
     // 4. cert_client_concat.pem
     let client_concat_path = haproxy_dir.join("cert_client_concat.pem");
     if !client_concat_path.exists() {
-        println!("\n  [4/4] cert_client_concat.pem: ✗ Not found");
+        println!("\n  [3/3] cert_client_concat.pem: ✗ Not found");
         results.push(false);
     } else {
         match inspect::verify_signed_by(&client_concat_path, &ca_path) {
             Ok(result) => {
-                println!("\n  [4/4] cert_client_concat.pem");
+                println!("\n  [3/3] cert_client_concat.pem");
                 println!("        Subject: {}", result.subject);
                 println!("        Issuer:  {}", result.issuer);
 
@@ -386,27 +389,30 @@ fn verify_haproxy_section(haproxy_dir: &Path, client_cert_dir: &Path, hostname: 
                 }
 
                 if result.expired {
-                    println!("        Expiry:  ✗ Expired ({} days ago)", -result.days_remaining);
+                    println!(
+                        "        Expiry:  ✗ Expired ({} days ago)",
+                        -result.days_remaining
+                    );
                 } else {
-                    println!("        Expiry:  ✓ Valid ({} days remaining)", result.days_remaining);
+                    println!(
+                        "        Expiry:  ✓ Valid ({} days remaining)",
+                        result.days_remaining
+                    );
                 }
 
                 // Show SANs
-                match inspect::parse_cert(&client_concat_path) {
-                    Ok(info) => {
-                        if !info.sans.is_empty() {
-                            println!("        SANs:");
-                            for san in &info.sans {
-                                println!("          - {}", san);
-                            }
+                if let Ok(info) = inspect::parse_cert(&client_concat_path) {
+                    if !info.sans.is_empty() {
+                        println!("        SANs:");
+                        for san in &info.sans {
+                            println!("          - {}", san);
                         }
                     }
-                    Err(_) => {}
                 }
-                results.push(true);
+                results.push(result.signed_by_ca && !result.expired);
             }
             Err(e) => {
-                println!("\n  [4/4] cert_client_concat.pem: ✗ Error: {}", e);
+                println!("\n  [3/3] cert_client_concat.pem: ✗ Error: {}", e);
                 results.push(false);
             }
         }
@@ -452,7 +458,10 @@ fn verify_cln_section(cln_dir: &Path, client_cert_dir: &Path) -> Vec<bool> {
                             if a == b {
                                 println!("        Compare: ✓ Matches {}", client_ca.display());
                             } else {
-                                println!("        Compare: ✗ Does NOT match {}", client_ca.display());
+                                println!(
+                                    "        Compare: ✗ Does NOT match {}",
+                                    client_ca.display()
+                                );
                             }
                         }
                         _ => {
@@ -460,7 +469,7 @@ fn verify_cln_section(cln_dir: &Path, client_cert_dir: &Path) -> Vec<bool> {
                         }
                     }
                 }
-                results.push(true);
+                results.push(info.is_ca);
             }
             Err(e) => {
                 println!("  [1/3] ca.pem: ✗ Parse error: {}", e);
@@ -559,7 +568,7 @@ fn verify_ca_section(cert_dir: &Path) -> Vec<bool> {
                 } else {
                     println!("        Status:  ✗ Not a CA certificate");
                 }
-                results.push(true);
+                results.push(info.is_ca);
             }
             Err(e) => {
                 println!("  [1/1] ca.pem: ✗ Parse error: {}", e);
@@ -572,7 +581,12 @@ fn verify_ca_section(cert_dir: &Path) -> Vec<bool> {
 }
 
 /// Handle `gcob certs verify`
-pub fn handle_verify(cert_dir: &Path, expected_hostname: Option<&str>, target: Option<VerifySubcommand>) {
+pub fn handle_verify(
+    cert_dir: &Path,
+    expected_hostname: Option<&str>,
+    cln_dir: Option<&Path>,
+    target: Option<VerifySubcommand>,
+) {
     if let Err(e) = check_gcob_access() {
         eprintln!("Error: {}", e);
         std::process::exit(1);
@@ -581,6 +595,9 @@ pub fn handle_verify(cert_dir: &Path, expected_hostname: Option<&str>, target: O
     let hostname = expected_hostname.unwrap_or("localhost");
     let target = target.unwrap_or(VerifySubcommand::All);
     let is_server = is_server_env();
+    // The CLN source is only used when explicitly provided; `$HOME` heuristics
+    // are no longer trusted for verification (SG-7).
+    let cln_source = cln_dir.map(ClnSourcePaths::new);
 
     if is_server {
         println!("=== Certificate Verification (Server Mode) ===\n");
@@ -597,9 +614,17 @@ pub fn handle_verify(cert_dir: &Path, expected_hostname: Option<&str>, target: O
         VerifySubcommand::Server => {
             if is_server {
                 let server_paths = ServerPaths::default_path();
-                let cln_source = ClnSourcePaths::default_home();
-                all_results.extend(verify_haproxy_section(&server_paths.haproxy_cert_dir, cert_dir, hostname));
-                all_results.extend(verify_cln_section(&cln_source.dir, cert_dir));
+                all_results.extend(verify_haproxy_section(
+                    &server_paths.haproxy_cert_dir,
+                    cert_dir,
+                    hostname,
+                ));
+                match &cln_source {
+                    Some(source) => all_results.extend(verify_cln_section(&source.dir, cert_dir)),
+                    None => println!(
+                        "  (CLN certificates skipped: pass --cln-dir <PATH> to verify them)\n"
+                    ),
+                }
             } else {
                 println!("⚠ Warning: 'verify server' is not applicable in client mode.");
                 println!("  Server certificates are only available on server machines.");
@@ -616,10 +641,18 @@ pub fn handle_verify(cert_dir: &Path, expected_hostname: Option<&str>, target: O
             // Server sections (only on server)
             if is_server {
                 let server_paths = ServerPaths::default_path();
-                let cln_source = ClnSourcePaths::default_home();
                 all_results.extend(verify_api_section(cert_dir, hostname));
-                all_results.extend(verify_haproxy_section(&server_paths.haproxy_cert_dir, cert_dir, hostname));
-                all_results.extend(verify_cln_section(&cln_source.dir, cert_dir));
+                all_results.extend(verify_haproxy_section(
+                    &server_paths.haproxy_cert_dir,
+                    cert_dir,
+                    hostname,
+                ));
+                match &cln_source {
+                    Some(source) => all_results.extend(verify_cln_section(&source.dir, cert_dir)),
+                    None => println!(
+                        "  (CLN certificates skipped: pass --cln-dir <PATH> to verify them)\n"
+                    ),
+                }
             }
         }
     }
@@ -649,7 +682,7 @@ fn verify_client_section(cert_dir: &Path, hostname: &str) -> Vec<bool> {
                 } else {
                     println!("        Status:  ✗ Not a CA certificate");
                 }
-                results.push(true);
+                results.push(info.is_ca);
             }
             Err(e) => {
                 println!("  [1/3] ca.pem: ✗ Parse error: {}", e);
@@ -680,22 +713,25 @@ fn verify_client_section(cert_dir: &Path, hostname: &str) -> Vec<bool> {
                 }
 
                 if result.expired {
-                    println!("        Expiry:  ✗ Expired ({} days ago)", -result.days_remaining);
+                    println!(
+                        "        Expiry:  ✗ Expired ({} days ago)",
+                        -result.days_remaining
+                    );
                 } else {
-                    println!("        Expiry:  ✓ Valid ({} days remaining)", result.days_remaining);
+                    println!(
+                        "        Expiry:  ✓ Valid ({} days remaining)",
+                        result.days_remaining
+                    );
                 }
 
                 // Show SANs
-                match inspect::parse_cert(&client_path) {
-                    Ok(info) => {
-                        if !info.sans.is_empty() {
-                            println!("        SANs:");
-                            for san in &info.sans {
-                                println!("          - {}", san);
-                            }
+                if let Ok(info) = inspect::parse_cert(&client_path) {
+                    if !info.sans.is_empty() {
+                        println!("        SANs:");
+                        for san in &info.sans {
+                            println!("          - {}", san);
                         }
                     }
-                    Err(_) => {}
                 }
 
                 // SAN check
@@ -704,7 +740,7 @@ fn verify_client_section(cert_dir: &Path, hostname: &str) -> Vec<bool> {
                     Ok(false) => println!("        SAN Check: ✗ Does NOT match '{}'", hostname),
                     Err(e) => println!("        SAN Check: ✗ Error: {}", e),
                 }
-                results.push(true);
+                results.push(result.signed_by_ca && !result.expired);
             }
             Err(e) => {
                 println!("\n  [2/3] client.pem: ✗ Error: {}", e);
@@ -750,8 +786,213 @@ fn verify_client_section(cert_dir: &Path, hostname: &str) -> Vec<bool> {
     results
 }
 
+/// Fully resolved request for a certificate renewal run.
+pub struct RenewRequest {
+    pub cln_dir: PathBuf,
+    pub cert_dir: PathBuf,
+    pub hostname: Option<String>,
+    pub ip: Option<String>,
+    pub init_ca: bool,
+    pub rotate_ca: bool,
+    pub api_user: String,
+    pub allow_loopback: bool,
+    pub dry_run: bool,
+    /// Test/CI override for the owner of the API material (default api user).
+    pub owner_override: Option<(u32, u32)>,
+}
+
+/// Result of a renewal run.
+#[derive(Debug)]
+pub struct RenewSummary {
+    pub ca_fingerprint: String,
+    pub identity: (String, String),
+    pub files: Vec<PublishedFile>,
+    pub dry_run: bool,
+}
+
+#[cfg(unix)]
+fn current_uid() -> u32 {
+    unsafe { libc::geteuid() }
+}
+
+#[cfg(not(unix))]
+fn current_uid() -> u32 {
+    0
+}
+
+/// Renew the API certificate material with a validated CA and atomic publication.
+///
+/// Security invariants:
+/// 1. The CA is loaded with `load_validated_ca` (no `$HOME` heuristic).
+/// 2. The new leaves are verified against the CA that will be installed.
+/// 3. Changing an installed CA requires `--rotate-ca`; installing a missing one
+///    requires `--init-ca`.
+/// 4. Nothing is published until staging and postconditions succeed; existing
+///    files are backed up and rolled back on failure.
+pub fn renew_certificates(req: &RenewRequest) -> Result<RenewSummary, CertError> {
+    let api = account_by_name(&req.api_user)?;
+    let owner = req.owner_override.unwrap_or((api.uid, api.gid));
+
+    let source = ClnSourcePaths::new(req.cln_dir.clone());
+    let validated = generate::load_validated_ca(&source)?;
+
+    // Identity: explicit flags first, otherwise reuse the existing server SANs.
+    let existing = req.cert_dir.join("server.pem");
+    let (existing_dns, existing_ip) = if existing.exists() {
+        inspect::san_identities(&existing).unwrap_or((None, None))
+    } else {
+        (None, None)
+    };
+
+    let hostname = req.hostname.clone().or(existing_dns).ok_or_else(|| {
+        CertError::MissingSource(
+            "cannot determine the server hostname; pass --server-hostname <HOST>".to_string(),
+        )
+    })?;
+    let ip = req.ip.clone().or(existing_ip).ok_or_else(|| {
+        CertError::MissingSource(
+            "cannot determine the server IP; pass --server-ip <IP>".to_string(),
+        )
+    })?;
+    detect::validate_hostname(&hostname, req.allow_loopback)?;
+    crate::certs::detect::validate_unicast_ip(&ip, req.allow_loopback)?;
+
+    // Destination directory: created securely, no symlinks, service ownership.
+    let euid = current_uid();
+    let mut allowed_owners = vec![0, euid, owner.0];
+    if let Ok(admin) = detect_admin_account() {
+        allowed_owners.push(admin.uid);
+    }
+    ensure_secure_dir(&req.cert_dir, 0o700, owner, &allowed_owners)?;
+
+    // CA pinning: never change the installed trust anchor silently.
+    let installed_ca = req.cert_dir.join("ca.pem");
+    let install_ca = if installed_ca.exists() {
+        let installed_fingerprint = generate::cert_fingerprint(&installed_ca)?;
+        if installed_fingerprint != validated.fingerprint_sha256 {
+            if !req.rotate_ca {
+                return Err(CertError::Parse(format!(
+                    "Installed CA {} has a different fingerprint ({}); pass --rotate-ca to replace it",
+                    installed_ca.display(),
+                    installed_fingerprint
+                )));
+            }
+            true
+        } else {
+            false
+        }
+    } else {
+        if !req.init_ca {
+            return Err(CertError::MissingSource(format!(
+                "{} does not exist; pass --init-ca to install the validated CLN CA",
+                installed_ca.display()
+            )));
+        }
+        true
+    };
+
+    let _lock = lock_dir(&req.cert_dir)?;
+
+    // Stage in the destination filesystem.
+    let stage = tempfile::Builder::new()
+        .prefix(".gcob-stage-")
+        .tempdir_in(&req.cert_dir)?;
+
+    generate::generate_server_cert(&validated.issuer, &hostname, &ip, stage.path())?;
+    generate::generate_client_cert(&validated.issuer, &hostname, stage.path())?;
+    let staged_ca = stage.path().join("ca.pem");
+    generate::write_atomic_owned(&staged_ca, validated.ca_pem.as_bytes(), 0o644, owner)?;
+
+    // Postconditions against the CA that will be installed.
+    let server_sans: BTreeSet<String> = [generate::san_token(&hostname), generate::san_token(&ip)]
+        .into_iter()
+        .collect();
+    let client_sans: BTreeSet<String> = [generate::san_token(&hostname)].into_iter().collect();
+
+    generate::verify_issued_cert(
+        &stage.path().join("server.pem"),
+        &stage.path().join("server-key.pem"),
+        &staged_ca,
+        &server_sans,
+        true,
+    )?;
+    generate::verify_issued_cert(
+        &stage.path().join("client.pem"),
+        &stage.path().join("client-key.pem"),
+        &staged_ca,
+        &client_sans,
+        false,
+    )?;
+
+    let server_fingerprint = generate::cert_fingerprint(&stage.path().join("server.pem"))?;
+    let client_fingerprint = generate::cert_fingerprint(&stage.path().join("client.pem"))?;
+
+    let mut plan = vec![
+        PlannedFile {
+            staged: stage.path().join("server.pem"),
+            target: req.cert_dir.join("server.pem"),
+            mode: 0o644,
+            owner,
+            fingerprint: Some(server_fingerprint),
+        },
+        PlannedFile {
+            staged: stage.path().join("server-key.pem"),
+            target: req.cert_dir.join("server-key.pem"),
+            mode: 0o600,
+            owner,
+            fingerprint: None,
+        },
+        PlannedFile {
+            staged: stage.path().join("client.pem"),
+            target: req.cert_dir.join("client.pem"),
+            mode: 0o644,
+            owner,
+            fingerprint: Some(client_fingerprint),
+        },
+        PlannedFile {
+            staged: stage.path().join("client-key.pem"),
+            target: req.cert_dir.join("client-key.pem"),
+            mode: 0o600,
+            owner,
+            fingerprint: None,
+        },
+    ];
+
+    if install_ca {
+        plan.push(PlannedFile {
+            staged: staged_ca,
+            target: installed_ca.clone(),
+            mode: 0o644,
+            owner,
+            fingerprint: Some(validated.fingerprint_sha256.clone()),
+        });
+    }
+
+    for file in &plan {
+        generate::apply_owner_mode(&file.staged, file.mode, file.owner)?;
+    }
+
+    if !req.dry_run {
+        publish_files(&plan)?;
+    }
+
+    Ok(RenewSummary {
+        ca_fingerprint: validated.fingerprint_sha256,
+        identity: (hostname, ip),
+        files: plan
+            .iter()
+            .map(|file| PublishedFile {
+                path: file.target.clone(),
+                mode: file.mode,
+                fingerprint: file.fingerprint.clone(),
+            })
+            .collect(),
+        dry_run: req.dry_run,
+    })
+}
+
 /// Handle `gcob certs renew [--force]`
-pub fn handle_renew(cert_dir: &Path, force: bool) {
+pub fn handle_renew(cert_dir: &Path, args: RenewArgs) {
     if let Err(e) = check_gcob_access() {
         eprintln!("Error: {}", e);
         std::process::exit(1);
@@ -760,7 +1001,7 @@ pub fn handle_renew(cert_dir: &Path, force: bool) {
     println!("=== Renewing Certificates ===\n");
 
     // Check if renewal is needed
-    if !force {
+    if !args.force {
         let server_path = cert_dir.join("server.pem");
         if server_path.exists() {
             match inspect::days_until_expiry(&server_path) {
@@ -774,107 +1015,241 @@ pub fn handle_renew(cert_dir: &Path, force: bool) {
         }
     }
 
-    // Read CA from CLN source
-    let cln_source = crate::certs::paths::ClnSourcePaths::default_home();
-    println!("[1/4] Reading CA from CLN source...");
-    let issuer = match crate::certs::generate::read_cln_ca(&cln_source) {
-        Ok(issuer) => {
-            println!("  [✓] CA loaded");
-            issuer
-        }
-        Err(e) => {
-            eprintln!("  [✗] Error: {}", e);
-            std::process::exit(1);
-        }
+    let request = RenewRequest {
+        cln_dir: args.cln_dir.clone(),
+        cert_dir: cert_dir.to_path_buf(),
+        hostname: args.server_hostname.clone(),
+        ip: args.server_ip.clone(),
+        init_ca: args.init_ca,
+        rotate_ca: args.rotate_ca,
+        api_user: args.api_user.clone(),
+        allow_loopback: args.allow_loopback,
+        dry_run: args.dry_run,
+        owner_override: None,
     };
 
-    // Create output directory
-    println!("[2/4] Creating certificate directory...");
-    if let Err(e) = std::fs::create_dir_all(cert_dir) {
-        eprintln!("  [✗] Error creating directory: {}", e);
-        std::process::exit(1);
+    match renew_certificates(&request) {
+        Ok(summary) => {
+            println!();
+            if summary.dry_run {
+                println!("=== Dry run complete: no files were written ===");
+            } else {
+                println!("=== Certificates renewed ===");
+            }
+            println!();
+            println!(
+                "  Identity:       {} ({})",
+                summary.identity.0, summary.identity.1
+            );
+            println!("  CA fingerprint: {}", summary.ca_fingerprint);
+            for file in &summary.files {
+                match &file.fingerprint {
+                    Some(fingerprint) => println!(
+                        "  {} (mode {:04o}) sha256:{}",
+                        file.path.display(),
+                        file.mode,
+                        fingerprint
+                    ),
+                    None => println!("  {} (mode {:04o})", file.path.display(), file.mode),
+                }
+            }
+        }
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
     }
-    println!("  [✓] {}", cert_dir.display());
-
-    // Generate server certificate
-    let hostname = std::env::var("CLN_HOSTNAME").unwrap_or_else(|_| "localhost".to_string());
-    let ip = std::env::var("CLN_IP").unwrap_or_else(|_| "127.0.0.1".to_string());
-
-    println!("[3/4] Generating server certificate...");
-    if let Err(e) = crate::certs::generate::generate_server_cert(&issuer, &hostname, &ip, cert_dir) {
-        eprintln!("  [✗] Error: {}", e);
-        std::process::exit(1);
-    }
-    println!("  [✓] server.pem generated with SAN");
-
-    // Generate client certificate
-    println!("[4/4] Generating client certificate...");
-    if let Err(e) = crate::certs::generate::generate_client_cert(&issuer, &hostname, cert_dir) {
-        eprintln!("  [✗] Error: {}", e);
-        std::process::exit(1);
-    }
-    println!("  [✓] client.pem generated");
-
-    // Set permissions
-    #[cfg(unix)]
-    {
-        use crate::certs::generate::set_permissions;
-        let _ = set_permissions(cert_dir, 0o700);
-        let _ = set_permissions(&cert_dir.join("server-key.pem"), 0o400);
-        let _ = set_permissions(&cert_dir.join("client-key.pem"), 0o400);
-    }
-
-    println!("\nDone! All certificates renewed.");
 }
 
-/// Handle `gcob sign --csr <FILE> --hostname <HOST>`
-pub fn handle_sign(csr_path: &Path, hostname: &str, output_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
+/// Maximum accepted CSR size (defense against oversized input DoS).
+const MAX_CSR_BYTES: u64 = 1 << 20;
+
+/// Fully resolved request for a CSR signing run.
+pub struct SignRequest {
+    pub csr: PathBuf,
+    pub hostname: String,
+    pub cln_dir: PathBuf,
+    pub output: PathBuf,
+    pub force: bool,
+    pub dry_run: bool,
+    pub expected_ca_fingerprint: Option<String>,
+    /// Test/CI override for the owner of the output material.
+    pub owner_override: Option<(u32, u32)>,
+}
+
+/// Result of a signing run.
+#[derive(Debug)]
+pub struct SignSummary {
+    pub ca_fingerprint: String,
+    pub cert_fingerprint: String,
+    pub path: PathBuf,
+    pub dry_run: bool,
+}
+
+/// Sign a CSR with a validated CA and publish the certificate atomically.
+///
+/// Security invariants:
+/// 1. CA loaded and validated (symlinks, permissions, `CA:TRUE`, key match).
+/// 2. Optional `--expected-ca-fingerprint` pinning.
+/// 3. Hostname validated (no wildcards/control chars) before signing.
+/// 4. CSR must be a regular, non-symlinked file within the size limit.
+/// 5. The issued certificate is verified against the CA and the CSR public key;
+///    nothing is published until then.
+pub fn sign_csr_file(req: &SignRequest) -> Result<SignSummary, CertError> {
+    detect::validate_hostname(&req.hostname, false)?;
+
+    // CSR must be a regular, non-symlinked, bounded file.
+    let csr_metadata = fs::symlink_metadata(&req.csr)?;
+    if csr_metadata.file_type().is_symlink() {
+        return Err(CertError::Parse(format!(
+            "Refusing to follow symlinked CSR: {}",
+            req.csr.display()
+        )));
+    }
+    if !csr_metadata.is_file() {
+        return Err(CertError::Parse(format!(
+            "CSR is not a regular file: {}",
+            req.csr.display()
+        )));
+    }
+    if csr_metadata.len() > MAX_CSR_BYTES {
+        return Err(CertError::Parse(format!(
+            "CSR {} exceeds the {} byte limit",
+            req.csr.display(),
+            MAX_CSR_BYTES
+        )));
+    }
+
+    // Validated CA + optional fingerprint pinning.
+    let source = ClnSourcePaths::new(req.cln_dir.clone());
+    let validated = generate::load_validated_ca(&source)?;
+    if let Some(expected) = &req.expected_ca_fingerprint {
+        if !validated
+            .fingerprint_sha256
+            .eq_ignore_ascii_case(expected.trim())
+        {
+            return Err(CertError::Parse(format!(
+                "CA fingerprint mismatch: found {}, expected {}",
+                validated.fingerprint_sha256, expected
+            )));
+        }
+    }
+
+    // Output directory: secure, owned by the current account.
+    let me = current_account()?;
+    let owner = req.owner_override.unwrap_or((me.uid, me.gid));
+    let mut allowed_owners = vec![0, owner.0];
+    if let Ok(admin) = detect_admin_account() {
+        allowed_owners.push(admin.uid);
+    }
+    ensure_secure_dir(&req.output, 0o700, owner, &allowed_owners)?;
+
+    let target = req.output.join("client.pem");
+    if target.exists() && !req.force {
+        return Err(CertError::Io(std::io::Error::other(format!(
+            "{} already exists; pass --force to overwrite it",
+            target.display()
+        ))));
+    }
+
+    let _lock = lock_dir(&req.output)?;
+
+    // Stage in the output filesystem.
+    let stage = tempfile::Builder::new()
+        .prefix(".gcob-stage-")
+        .tempdir_in(&req.output)?;
+
+    generate::sign_csr(&req.csr, &req.hostname, &validated.issuer, stage.path())?;
+
+    let staged_ca = stage.path().join("ca.pem");
+    generate::write_atomic_owned(&staged_ca, validated.ca_pem.as_bytes(), 0o644, owner)?;
+
+    // Postcondition: chain to the CA, clientAuth only, exact SAN, CSR key match.
+    let expected_sans: BTreeSet<String> =
+        [generate::san_token(&req.hostname)].into_iter().collect();
+    generate::verify_signed_csr(
+        &stage.path().join("client.pem"),
+        &req.csr,
+        &staged_ca,
+        &expected_sans,
+    )?;
+
+    let cert_fingerprint = generate::cert_fingerprint(&stage.path().join("client.pem"))?;
+    let plan = vec![PlannedFile {
+        staged: stage.path().join("client.pem"),
+        target: target.clone(),
+        mode: 0o644,
+        owner,
+        fingerprint: Some(cert_fingerprint.clone()),
+    }];
+
+    for file in &plan {
+        generate::apply_owner_mode(&file.staged, file.mode, file.owner)?;
+    }
+
+    if !req.dry_run {
+        publish_files(&plan)?;
+    }
+
+    Ok(SignSummary {
+        ca_fingerprint: validated.fingerprint_sha256,
+        cert_fingerprint,
+        path: target,
+        dry_run: req.dry_run,
+    })
+}
+
+/// Handle `gcob sign --csr <FILE> --hostname <HOST> --cln-dir <PATH> --output <DIR>`
+pub fn handle_sign(args: SignArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Validate user has permission to manage certificates
-    check_gcob_access().map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+    check_gcob_access()?;
 
     println!("=== Signing Client Certificate ===\n");
-    println!("  CSR:      {}", csr_path.display());
-    println!("  Hostname: {}", hostname);
-    println!("  Output:   {}/client.pem", output_dir.display());
-    println!();
 
-    // Verify CSR exists
-    if !csr_path.exists() {
-        eprintln!("Error: CSR file not found: {}", csr_path.display());
-        std::process::exit(1);
-    }
+    let request = SignRequest {
+        csr: args.csr.clone(),
+        hostname: args.hostname.clone(),
+        cln_dir: args.cln_dir.clone(),
+        output: args.output.clone(),
+        force: args.force,
+        dry_run: args.dry_run,
+        expected_ca_fingerprint: args.expected_ca_fingerprint.clone(),
+        owner_override: None,
+    };
 
-    // Read CA from CLN source
-    let cln_source = crate::certs::paths::ClnSourcePaths::default_home();
-    println!("[1/3] Reading CA from CLN source...");
-    let issuer = crate::certs::generate::read_cln_ca(&cln_source)?;
-    println!("  [✓] CA loaded");
-
-    // Create output directory
-    println!("[2/3] Creating output directory...");
-    std::fs::create_dir_all(output_dir)?;
-    println!("  [✓] {}", output_dir.display());
-
-    // Sign CSR
-    println!("[3/3] Signing CSR...");
-    crate::certs::generate::sign_csr(csr_path, &issuer, output_dir)?;
-    println!("  [✓] client.pem signed by CA");
-
-    // Set permissions
-    #[cfg(unix)]
-    {
-        use crate::certs::generate::set_permissions;
-        let _ = set_permissions(&output_dir.join("client.pem"), 0o444);
-    }
+    let summary = sign_csr_file(&request)?;
 
     println!();
-    println!("=== Certificate signed successfully ===");
+    if summary.dry_run {
+        println!("=== Dry run complete: no files were written ===");
+    } else {
+        println!("=== Certificate signed successfully ===");
+    }
+    println!();
+    println!("  Subject:        {}", args.hostname);
+    println!("  CA fingerprint: {}", summary.ca_fingerprint);
+    println!(
+        "  Cert:           {} sha256:{}",
+        summary.path.display(),
+        summary.cert_fingerprint
+    );
     println!();
     println!("Send to client:");
-    println!("  {}/ca.pem", cln_source.dir.display());
-    println!("  {}/client.pem", output_dir.display());
+    println!("  {}/ca.pem", request.cln_dir.display());
+    println!("  {}", summary.path.display());
 
     Ok(())
+}
+
+/// Resolve the local certificate directory or exit with a clear message.
+fn resolve_cert_dir() -> PathBuf {
+    match default_cert_dir() {
+        Ok(dir) => dir,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    }
 }
 
 /// Dispatch certs command
@@ -882,16 +1257,414 @@ pub fn dispatch(command: super::CertsCommand) {
     match command {
         super::CertsCommand::List { server } => handle_list(server),
         super::CertsCommand::Show { cert } => {
-            let cert_path = cert.unwrap_or_else(|| default_cert_dir().join("server.pem"));
+            let cert_path = match cert {
+                Some(path) => path,
+                None => resolve_cert_dir().join("server.pem"),
+            };
             handle_show(&cert_path);
         }
-        super::CertsCommand::Verify { hostname, target } => {
-            let cert_dir = default_cert_dir();
-            handle_verify(&cert_dir, hostname.as_deref(), target);
+        super::CertsCommand::Verify {
+            hostname,
+            cln_dir,
+            target,
+        } => {
+            let cert_dir = resolve_cert_dir();
+            handle_verify(&cert_dir, hostname.as_deref(), cln_dir.as_deref(), target);
         }
-        super::CertsCommand::Renew { force } => {
-            let cert_dir = default_cert_dir();
-            handle_renew(&cert_dir, force);
+        super::CertsCommand::Renew {
+            force,
+            server_hostname,
+            server_ip,
+            cln_dir,
+            init_ca,
+            rotate_ca,
+            api_user,
+            allow_loopback,
+            dry_run,
+        } => {
+            let cert_dir = resolve_cert_dir();
+            handle_renew(
+                &cert_dir,
+                RenewArgs {
+                    force,
+                    server_hostname,
+                    server_ip,
+                    cln_dir,
+                    init_ca,
+                    rotate_ca,
+                    api_user,
+                    allow_loopback,
+                    dry_run,
+                },
+            );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::certs::paths::current_account;
+    use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, KeyPair};
+
+    fn temp_dir() -> tempfile::TempDir {
+        tempfile::tempdir().expect("temp dir")
+    }
+
+    /// Create a CA and write `ca.pem` + `ca-key.pem` (0600) into `dir`.
+    fn write_ca(dir: &Path) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let key = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "gcob-ca");
+        let cert = params.self_signed(&key).unwrap();
+
+        fs::write(dir.join("ca.pem"), cert.pem()).unwrap();
+        fs::write(dir.join("ca-key.pem"), key.serialize_pem()).unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir.join("ca-key.pem"), fs::Permissions::from_mode(0o600)).unwrap();
+        }
+    }
+
+    fn request(ca_dir: &Path, cert_dir: &Path, init_ca: bool) -> RenewRequest {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(cert_dir, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let me = current_account().unwrap();
+        RenewRequest {
+            cln_dir: ca_dir.to_path_buf(),
+            cert_dir: cert_dir.to_path_buf(),
+            hostname: Some("node.example".to_string()),
+            ip: Some("10.0.0.5".to_string()),
+            init_ca,
+            rotate_ca: false,
+            api_user: me.name,
+            allow_loopback: false,
+            dry_run: false,
+            owner_override: Some((me.uid, me.gid)),
+        }
+    }
+
+    fn server_sans() -> BTreeSet<String> {
+        [
+            generate::san_token("node.example"),
+            generate::san_token("10.0.0.5"),
+        ]
+        .into_iter()
+        .collect()
+    }
+
+    #[test]
+    fn renew_init_ca_publishes_and_verifies() {
+        let ca_dir = temp_dir();
+        let cert_dir = temp_dir();
+        write_ca(ca_dir.path());
+
+        let summary = renew_certificates(&request(ca_dir.path(), cert_dir.path(), true)).unwrap();
+        assert_eq!(
+            summary.identity,
+            ("node.example".to_string(), "10.0.0.5".to_string())
+        );
+        assert_eq!(summary.files.len(), 5);
+
+        for name in [
+            "ca.pem",
+            "server.pem",
+            "server-key.pem",
+            "client.pem",
+            "client-key.pem",
+        ] {
+            assert!(cert_dir.path().join(name).exists(), "missing {name}");
+        }
+
+        generate::verify_issued_cert(
+            &cert_dir.path().join("server.pem"),
+            &cert_dir.path().join("server-key.pem"),
+            &cert_dir.path().join("ca.pem"),
+            &server_sans(),
+            true,
+        )
+        .unwrap();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(cert_dir.path().join("server-key.pem"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[test]
+    fn renew_requires_init_ca_when_missing() {
+        let ca_dir = temp_dir();
+        let cert_dir = temp_dir();
+        write_ca(ca_dir.path());
+
+        let err = renew_certificates(&request(ca_dir.path(), cert_dir.path(), false)).unwrap_err();
+        assert!(format!("{}", err).contains("--init-ca"), "{err}");
+    }
+
+    #[test]
+    fn renew_rejects_ca_change_without_rotate() {
+        let ca1 = temp_dir();
+        let ca2 = temp_dir();
+        let cert_dir = temp_dir();
+        write_ca(ca1.path());
+        write_ca(ca2.path());
+
+        renew_certificates(&request(ca1.path(), cert_dir.path(), true)).unwrap();
+
+        let err = renew_certificates(&request(ca2.path(), cert_dir.path(), false)).unwrap_err();
+        assert!(format!("{}", err).contains("--rotate-ca"), "{err}");
+
+        let mut rotate = request(ca2.path(), cert_dir.path(), false);
+        rotate.rotate_ca = true;
+        renew_certificates(&rotate).unwrap();
+
+        let installed = generate::cert_fingerprint(&cert_dir.path().join("ca.pem")).unwrap();
+        let source = generate::cert_fingerprint(&ca2.path().join("ca.pem")).unwrap();
+        assert_eq!(installed, source);
+    }
+
+    #[test]
+    fn renew_reuses_existing_identity() {
+        let ca_dir = temp_dir();
+        let cert_dir = temp_dir();
+        write_ca(ca_dir.path());
+
+        renew_certificates(&request(ca_dir.path(), cert_dir.path(), true)).unwrap();
+
+        let mut reuse = request(ca_dir.path(), cert_dir.path(), false);
+        reuse.hostname = None;
+        reuse.ip = None;
+        let summary = renew_certificates(&reuse).unwrap();
+        assert_eq!(
+            summary.identity,
+            ("node.example".to_string(), "10.0.0.5".to_string())
+        );
+    }
+
+    #[test]
+    fn renew_rejects_invalid_identity() {
+        let ca_dir = temp_dir();
+        let cert_dir = temp_dir();
+        write_ca(ca_dir.path());
+
+        let mut bad = request(ca_dir.path(), cert_dir.path(), true);
+        bad.hostname = Some("*.example.com".to_string());
+        let err = renew_certificates(&bad).unwrap_err();
+        assert!(format!("{}", err).contains("Wildcard"), "{err}");
+
+        let mut bad_ip = request(ca_dir.path(), cert_dir.path(), true);
+        bad_ip.ip = Some("0.0.0.0".to_string());
+        let err = renew_certificates(&bad_ip).unwrap_err();
+        assert!(format!("{}", err).contains("unicast"), "{err}");
+    }
+
+    #[test]
+    fn renew_dry_run_writes_nothing() {
+        let ca_dir = temp_dir();
+        let cert_dir = temp_dir();
+        write_ca(ca_dir.path());
+
+        let mut dry = request(ca_dir.path(), cert_dir.path(), true);
+        dry.dry_run = true;
+        let summary = renew_certificates(&dry).unwrap();
+        assert!(summary.dry_run);
+        assert!(!cert_dir.path().join("server.pem").exists());
+        assert!(!cert_dir.path().join("ca.pem").exists());
+    }
+
+    #[test]
+    fn renew_rejects_group_writable_dir() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let ca_dir = temp_dir();
+            let cert_dir = temp_dir();
+            write_ca(ca_dir.path());
+            let req = request(ca_dir.path(), cert_dir.path(), true);
+            fs::set_permissions(cert_dir.path(), fs::Permissions::from_mode(0o777)).unwrap();
+
+            let err = renew_certificates(&req).unwrap_err();
+            assert!(format!("{}", err).contains("group/other writable"), "{err}");
+        }
+    }
+
+    fn sign_request(ca_dir: &Path, csr: &Path, output: &Path) -> SignRequest {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(output, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        let me = current_account().unwrap();
+        SignRequest {
+            csr: csr.to_path_buf(),
+            hostname: "client.example".to_string(),
+            cln_dir: ca_dir.to_path_buf(),
+            output: output.to_path_buf(),
+            force: false,
+            dry_run: false,
+            expected_ca_fingerprint: None,
+            owner_override: Some((me.uid, me.gid)),
+        }
+    }
+
+    fn test_csr(dir: &Path) -> PathBuf {
+        generate::generate_csr("client.example", None, dir).unwrap();
+        dir.join("client.csr")
+    }
+
+    #[test]
+    fn sign_issues_and_verifies() {
+        let ca_dir = temp_dir();
+        let csr_dir = temp_dir();
+        let out_dir = temp_dir();
+        write_ca(ca_dir.path());
+        let csr = test_csr(csr_dir.path());
+
+        let summary = sign_csr_file(&sign_request(ca_dir.path(), &csr, out_dir.path())).unwrap();
+        assert!(summary.path.exists());
+
+        let sans: BTreeSet<String> = [generate::san_token("client.example")]
+            .into_iter()
+            .collect();
+        generate::verify_signed_csr(
+            &out_dir.path().join("client.pem"),
+            &csr,
+            &ca_dir.path().join("ca.pem"),
+            &sans,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn sign_rejects_wrong_ca_fingerprint() {
+        let ca_dir = temp_dir();
+        let csr_dir = temp_dir();
+        let out_dir = temp_dir();
+        write_ca(ca_dir.path());
+        let csr = test_csr(csr_dir.path());
+
+        let mut req = sign_request(ca_dir.path(), &csr, out_dir.path());
+        req.expected_ca_fingerprint = Some("00".repeat(32));
+        let err = sign_csr_file(&req).unwrap_err();
+        assert!(format!("{}", err).contains("fingerprint mismatch"), "{err}");
+    }
+
+    #[test]
+    fn sign_rejects_wildcard_hostname() {
+        let ca_dir = temp_dir();
+        let csr_dir = temp_dir();
+        let out_dir = temp_dir();
+        write_ca(ca_dir.path());
+        let csr = test_csr(csr_dir.path());
+
+        let mut req = sign_request(ca_dir.path(), &csr, out_dir.path());
+        req.hostname = "*.example.com".to_string();
+        let err = sign_csr_file(&req).unwrap_err();
+        assert!(format!("{}", err).contains("Wildcard"), "{err}");
+    }
+
+    #[test]
+    fn sign_requires_force_when_output_exists() {
+        let ca_dir = temp_dir();
+        let csr_dir = temp_dir();
+        let out_dir = temp_dir();
+        write_ca(ca_dir.path());
+        let csr = test_csr(csr_dir.path());
+
+        sign_csr_file(&sign_request(ca_dir.path(), &csr, out_dir.path())).unwrap();
+
+        let err = sign_csr_file(&sign_request(ca_dir.path(), &csr, out_dir.path())).unwrap_err();
+        assert!(format!("{}", err).contains("--force"), "{err}");
+
+        let mut forced = sign_request(ca_dir.path(), &csr, out_dir.path());
+        forced.force = true;
+        sign_csr_file(&forced).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sign_rejects_symlinked_output_dir() {
+        let ca_dir = temp_dir();
+        let csr_dir = temp_dir();
+        write_ca(ca_dir.path());
+        let csr = test_csr(csr_dir.path());
+
+        let real = temp_dir();
+        let link_base = temp_dir();
+        let link = link_base.path().join("out");
+        std::os::unix::fs::symlink(real.path(), &link).unwrap();
+
+        let req = sign_request(ca_dir.path(), &csr, &link);
+        let err = sign_csr_file(&req).unwrap_err();
+        assert!(format!("{}", err).contains("symlink"), "{err}");
+    }
+
+    #[test]
+    fn sign_dry_run_writes_nothing() {
+        let ca_dir = temp_dir();
+        let csr_dir = temp_dir();
+        let out_dir = temp_dir();
+        write_ca(ca_dir.path());
+        let csr = test_csr(csr_dir.path());
+
+        let mut req = sign_request(ca_dir.path(), &csr, out_dir.path());
+        req.dry_run = true;
+        let summary = sign_csr_file(&req).unwrap();
+        assert!(summary.dry_run);
+        assert!(!out_dir.path().join("client.pem").exists());
+    }
+
+    #[test]
+    fn sign_rejects_oversized_csr() {
+        let ca_dir = temp_dir();
+        let csr_dir = temp_dir();
+        let out_dir = temp_dir();
+        write_ca(ca_dir.path());
+
+        let big = csr_dir.path().join("big.csr");
+        fs::write(&big, vec![b'A'; (MAX_CSR_BYTES + 1) as usize]).unwrap();
+
+        let req = sign_request(ca_dir.path(), &big, out_dir.path());
+        let err = sign_csr_file(&req).unwrap_err();
+        assert!(format!("{}", err).contains("byte limit"), "{err}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sign_rejects_csr_symlink() {
+        let ca_dir = temp_dir();
+        let csr_dir = temp_dir();
+        let out_dir = temp_dir();
+        write_ca(ca_dir.path());
+        let csr = test_csr(csr_dir.path());
+
+        let link = csr_dir.path().join("linked.csr");
+        std::os::unix::fs::symlink(&csr, &link).unwrap();
+
+        let req = sign_request(ca_dir.path(), &link, out_dir.path());
+        let err = sign_csr_file(&req).unwrap_err();
+        assert!(format!("{}", err).contains("symlinked CSR"), "{err}");
     }
 }
