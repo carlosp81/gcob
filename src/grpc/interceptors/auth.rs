@@ -231,7 +231,7 @@ mod tests {
 
         // Both should be extracted (validation is CLN's responsibility)
         assert_eq!(extract_rune_from_request(&req_orig), Some(original.into()));
-        assert_eq!(extract_rune_from_request(&req_alt), Some(altered.clone().into()));
+        assert_eq!(extract_rune_from_request(&req_alt), Some(altered.clone()));
         // But they should be different strings
         assert_ne!(original, altered.as_str());
     }
@@ -250,7 +250,7 @@ mod tests {
         );
         assert_eq!(
             extract_rune_from_request(&request_with_rune(&altered)),
-            Some(altered.into())
+            Some(altered)
         );
     }
 

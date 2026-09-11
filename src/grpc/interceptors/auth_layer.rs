@@ -160,7 +160,7 @@ where
                 .await
                 .map_err(|e| {
                     let msg = format!("Failed to read request body: {}", e);
-                    Box::new(std::io::Error::new(std::io::ErrorKind::Other, msg))
+                    Box::new(std::io::Error::other(msg))
                         as Box<dyn std::error::Error + Send + Sync>
                 })?
                 .to_bytes();
@@ -171,7 +171,7 @@ where
             // Async rune validation via CLN check_rune (now with params)
             validate_rune(&client, &rune, method, params).await.map_err(|e| {
                 let msg = e.message().to_string();
-                Box::new(std::io::Error::new(std::io::ErrorKind::Other, msg))
+                Box::new(std::io::Error::other(msg))
                     as Box<dyn std::error::Error + Send + Sync>
             })?;
 
