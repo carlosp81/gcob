@@ -32,6 +32,9 @@ const SERVER_ONLY_ARGS: &[&str] = &[
 const CLIENT_ONLY_ARGS: &[&str] = &["client_hostname", "client_ip"];
 
 const INIT_CLIENT_NOTES: &str = "\
+DEPRECATED: use 'gcob-client init' on the client host instead. This path will be
+removed in a future release.
+
 Notes:
   - Generates client.csr and client-key.pem; keep the private key secret.
   - Send client.csr to the server and run 'gcob sign' there to obtain client.pem.
@@ -89,12 +92,19 @@ pub fn render_init_help(mode: InitHelpMode) -> String {
     match mode {
         InitHelpMode::Client => {
             init = init
-                .about("Initialize client certificates (CSR generation)")
+                .about("Deprecated: generate the client CSR with 'gcob-client init'")
                 .override_usage("gcob init --client [OPTIONS]")
                 .after_help(INIT_CLIENT_NOTES);
             init = hide_args(init, &["server"]);
             init = hide_args(init, SERVER_ONLY_ARGS);
-            init = init.mut_arg("client", |arg| arg.help_heading("Mode (--client)"));
+            // The deprecated client path is hidden from `init --help` but must
+            // remain documented when explicitly requested.
+            init = init.mut_arg("client", |arg| {
+                arg.hide(false).help_heading("Mode (--client)")
+            });
+            for id in CLIENT_ONLY_ARGS.iter().copied() {
+                init = init.mut_arg(id, |arg| arg.hide(false));
+            }
         }
         InitHelpMode::Server => {
             init = init
@@ -138,9 +148,15 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Commands {
     /// Initialize certificates and configuration
+    #[command(after_help = "Note: client CSR generation moved to 'gcob-client init'.")]
     Init {
-        /// Generate CSR for external client (no CA needed)
-        #[arg(long, conflicts_with = "server", help_heading = "Mode (choose one)")]
+        /// Deprecated: generate the client CSR with 'gcob-client init'
+        #[arg(
+            long,
+            hide = true,
+            conflicts_with = "server",
+            help_heading = "Mode (choose one)"
+        )]
         client: bool,
 
         /// Generate server certificates for HAProxy mTLS
@@ -163,6 +179,7 @@ pub enum Commands {
         /// Hostname for client certificate (auto-detected if not specified)
         #[arg(
             long,
+            hide = true,
             conflicts_with = "server",
             requires = "client",
             help_heading = "Client options (--client)"
@@ -172,6 +189,7 @@ pub enum Commands {
         /// IP address for client certificate SAN (auto-detected if not specified)
         #[arg(
             long,
+            hide = true,
             conflicts_with = "server",
             requires = "client",
             help_heading = "Client options (--client)"
@@ -504,7 +522,7 @@ mod tests {
     }
 
     #[test]
-    fn init_help_has_mode_sections() {
+    fn init_help_is_server_only() {
         let mut command = Cli::command();
         let init = command
             .find_subcommand_mut("init")
@@ -513,11 +531,14 @@ mod tests {
         for heading in [
             "Mode (choose one)",
             "Common options",
-            "Client options (--client)",
             "Server options (--server)",
         ] {
             assert!(help.contains(heading), "missing heading: {heading}");
         }
+        // The deprecated client path is hidden from the default help.
+        assert!(!help.contains("Client options (--client)"), "{help}");
+        assert!(!help.contains("--client-hostname"), "{help}");
+        assert!(help.contains("gcob-client init"), "{help}");
     }
 
     fn os_args(args: &[&str]) -> Vec<OsString> {
@@ -550,13 +571,14 @@ mod tests {
     }
 
     #[test]
-    fn init_client_help_is_contextual() {
+    fn init_client_help_is_contextual_and_deprecated() {
         let help = render_init_help(InitHelpMode::Client);
         assert!(help.contains("Mode (--client)"), "{help}");
         assert!(help.contains("Client options (--client)"), "{help}");
         assert!(help.contains("Common options"), "{help}");
         assert!(help.contains("gcob init --client [OPTIONS]"), "{help}");
-        assert!(help.contains("keep the private key secret"), "{help}");
+        assert!(help.contains("DEPRECATED"), "{help}");
+        assert!(help.contains("gcob-client init"), "{help}");
         assert!(!help.contains("--cln-dir"), "{help}");
         assert!(!help.contains("--haproxy-user"), "{help}");
         assert!(!help.contains("Server options"), "{help}");
