@@ -3,10 +3,14 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
+use bytes::Bytes;
+use http_body_util::BodyExt;
+use prost::Message;
 use tower::{Layer, Service};
 use tonic::Status;
 
 use crate::cln::client::ClnClient;
+use crate::cln::cln_api;
 
 use super::auth::{validate_rune, RUNE_HEADER};
 
@@ -31,6 +35,36 @@ fn rune_method_for_path(path: &str) -> Option<&'static str> {
 fn unauthenticated_response(message: &str) -> http::Response<tonic::body::Body> {
     tracing::warn!(message = %message, "Auth rejected");
     Status::unauthenticated(message).into_http()
+}
+
+// --- Protobuf param extraction for rune validation ---
+
+fn extract_params_for_path(path: &str, body: &[u8]) -> Vec<String> {
+    match path {
+        "/cln.NodeServices/Invoice" => {
+            let req = cln_api::InvoiceRequest::decode(body).unwrap_or_default();
+            let amount = req
+                .amount_msat
+                .and_then(|a| a.value)
+                .map(|v| match v {
+                    cln_api::amount_or_any::Value::Amount(a) => a.msat.to_string(),
+                    cln_api::amount_or_any::Value::Any(_) => "any".to_string(),
+                })
+                .unwrap_or_default();
+            vec![amount, req.label, req.description]
+        }
+        "/cln.NodeServices/Xpay" => {
+            let req = cln_api::XpayRequest::decode(body).unwrap_or_default();
+            let amount = req
+                .amount_msat
+                .map(|a| a.msat.to_string())
+                .unwrap_or_default();
+            vec![req.invstring, amount]
+        }
+        // Getinfo, InvoiceStream, XpayStreamWatch, XpayStream, InvoiceWatch,
+        // WatchChannels, WatchPeers, WatchSystem have no params for rune validation
+        _ => vec![],
+    }
 }
 
 // --- Layer ---
@@ -65,15 +99,14 @@ pub struct AuthService<S> {
     client: Arc<ClnClient>,
 }
 
-impl<S, ReqBody> Service<http::Request<ReqBody>> for AuthService<S>
+impl<S> Service<http::Request<tonic::body::Body>> for AuthService<S>
 where
-    S: Service<http::Request<ReqBody>, Response = http::Response<tonic::body::Body>>
+    S: Service<http::Request<tonic::body::Body>, Response = http::Response<tonic::body::Body>>
         + Clone
         + Send
         + 'static,
     S::Future: Send + 'static,
     S::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-    ReqBody: Send + 'static,
 {
     type Response = S::Response;
     type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -83,7 +116,7 @@ where
         self.inner.poll_ready(cx).map_err(Into::into)
     }
 
-    fn call(&mut self, req: http::Request<ReqBody>) -> Self::Future {
+    fn call(&mut self, req: http::Request<tonic::body::Body>) -> Self::Future {
         let path = req.uri().path().to_string();
 
         // Extract rune from gRPC metadata headers
@@ -118,14 +151,35 @@ where
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
-            // Async rune validation via CLN check_rune
-            validate_rune(&client, &rune, method).await.map_err(|e| {
+            // Split request to read body
+            let (parts, body) = req.into_parts();
+
+            // Collect body bytes for protobuf decoding
+            let body_bytes: Bytes = body
+                .collect()
+                .await
+                .map_err(|e| {
+                    let msg = format!("Failed to read request body: {}", e);
+                    Box::new(std::io::Error::new(std::io::ErrorKind::Other, msg))
+                        as Box<dyn std::error::Error + Send + Sync>
+                })?
+                .to_bytes();
+
+            // Extract params from protobuf body
+            let params = extract_params_for_path(&path, &body_bytes);
+
+            // Async rune validation via CLN check_rune (now with params)
+            validate_rune(&client, &rune, method, params).await.map_err(|e| {
                 let msg = e.message().to_string();
                 Box::new(std::io::Error::new(std::io::ErrorKind::Other, msg))
                     as Box<dyn std::error::Error + Send + Sync>
             })?;
 
             tracing::info!(path = %path, method = %method, "Rune validated - request allowed through");
+
+            // Reconstruct request with original body bytes as tonic::body::Body
+            let body = tonic::body::Body::new(http_body_util::Full::new(body_bytes));
+            let req = http::Request::from_parts(parts, body);
 
             inner.call(req).await.map_err(Into::into)
         })
@@ -160,5 +214,77 @@ mod tests {
     #[test]
     fn rune_header_constant_is_lowercase() {
         assert_eq!(RUNE_HEADER, "x-rune");
+    }
+
+    #[test]
+    fn extract_params_invoice_basic() {
+        let req = cln_api::InvoiceRequest {
+            amount_msat: Some(cln_api::AmountOrAny {
+                value: Some(cln_api::amount_or_any::Value::Amount(cln_api::Amount {
+                    msat: 50000,
+                })),
+            }),
+            label: "test-label".to_string(),
+            description: "test-desc".to_string(),
+            ..Default::default()
+        };
+        let mut body = Vec::new();
+        req.encode(&mut body).unwrap();
+
+        let params = extract_params_for_path("/cln.NodeServices/Invoice", &body);
+        assert_eq!(params, vec!["50000", "test-label", "test-desc"]);
+    }
+
+    #[test]
+    fn extract_params_invoice_any_amount() {
+        let req = cln_api::InvoiceRequest {
+            amount_msat: Some(cln_api::AmountOrAny {
+                value: Some(cln_api::amount_or_any::Value::Any(true)),
+            }),
+            label: "any-label".to_string(),
+            description: "any-desc".to_string(),
+            ..Default::default()
+        };
+        let mut body = Vec::new();
+        req.encode(&mut body).unwrap();
+
+        let params = extract_params_for_path("/cln.NodeServices/Invoice", &body);
+        assert_eq!(params, vec!["any", "any-label", "any-desc"]);
+    }
+
+    #[test]
+    fn extract_params_xpay() {
+        let req = cln_api::XpayRequest {
+            invstring: "lnbc1...".to_string(),
+            amount_msat: Some(cln_api::Amount { msat: 100000 }),
+            ..Default::default()
+        };
+        let mut body = Vec::new();
+        req.encode(&mut body).unwrap();
+
+        let params = extract_params_for_path("/cln.NodeServices/Xpay", &body);
+        assert_eq!(params, vec!["lnbc1...", "100000"]);
+    }
+
+    #[test]
+    fn extract_params_getinfo_returns_empty() {
+        let params = extract_params_for_path("/cln.NodeServices/Getinfo", &[]);
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn extract_params_unknown_path_returns_empty() {
+        let params = extract_params_for_path("/cln.NodeServices/UnknownRpc", &[]);
+        assert!(params.is_empty());
+    }
+
+    #[test]
+    fn extract_params_malformed_body_returns_empty_or_default() {
+        let params = extract_params_for_path("/cln.NodeServices/Invoice", b"invalid");
+        // decode fails, returns default InvoiceRequest
+        assert_eq!(params.len(), 3);
+        assert_eq!(params[0], ""); // amount defaults to ""
+        assert_eq!(params[1], ""); // label defaults to ""
+        assert_eq!(params[2], ""); // description defaults to ""
     }
 }

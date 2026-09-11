@@ -31,12 +31,13 @@ pub(crate) async fn validate_rune(
     client: &ClnClient,
     rune: &str,
     method: &str,
+    params: Vec<String>,
 ) -> Result<(), Status> {
     let check_request = cln_api::CheckruneRequest {
         rune: rune.to_string(),
         nodeid: None,
         method: Some(method.to_string()),
-        params: vec![],
+        params,
     };
 
     let mut cln_client = client.inner.clone();
