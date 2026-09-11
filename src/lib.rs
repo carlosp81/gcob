@@ -6,3 +6,4 @@ pub mod domain;
 pub mod events;
 pub mod grpc;
 pub mod infra;
+pub mod role;

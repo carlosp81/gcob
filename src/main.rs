@@ -79,6 +79,10 @@ async fn main() {
             }
         }
         Commands::Serve => {
+            if let Err(e) = gcob::role::require_server("serve") {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
             tracing::info!("Starting gcob");
             if let Err(e) = cli::server::handle_serve().await {
                 tracing::error!("Server failed: {}", e);
@@ -94,6 +98,10 @@ async fn main() {
             dry_run,
             expected_ca_fingerprint,
         } => {
+            if let Err(e) = gcob::role::require_server("sign") {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
             let args = cli::certs::SignArgs {
                 csr,
                 hostname,
