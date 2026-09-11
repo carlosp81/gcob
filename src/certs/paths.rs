@@ -13,22 +13,51 @@ pub struct AdminAccount {
     pub home: PathBuf,
 }
 
+/// Copy an account entry out of the caller-provided buffer.
+#[cfg(unix)]
+fn copy_passwd(entry: &libc::passwd) -> Option<AdminAccount> {
+    if entry.pw_name.is_null() || entry.pw_dir.is_null() {
+        return None;
+    }
+    Some(AdminAccount {
+        name: unsafe { CStr::from_ptr(entry.pw_name) }
+            .to_string_lossy()
+            .into_owned(),
+        uid: entry.pw_uid,
+        gid: entry.pw_gid,
+        home: PathBuf::from(
+            unsafe { CStr::from_ptr(entry.pw_dir) }
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    })
+}
+
+/// Buffer size for the reentrant passwd lookups. 16 KiB is well above the
+/// typical `sysconf(_SC_GETPW_R_SIZE_MAX)` value (1024 on glibc).
+#[cfg(unix)]
+const PASSWD_BUFFER_SIZE: usize = 16 * 1024;
+
 #[cfg(unix)]
 fn account_from_name(name: &str) -> Option<AdminAccount> {
     let cname = std::ffi::CString::new(name).ok()?;
-    unsafe {
-        let pwd = libc::getpwnam(cname.as_ptr());
-        if pwd.is_null() {
-            return None;
-        }
-        let entry = &*pwd;
-        Some(AdminAccount {
-            name: CStr::from_ptr(entry.pw_name).to_string_lossy().to_string(),
-            uid: entry.pw_uid,
-            gid: entry.pw_gid,
-            home: PathBuf::from(CStr::from_ptr(entry.pw_dir).to_string_lossy().to_string()),
-        })
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buffer = vec![0u8; PASSWD_BUFFER_SIZE];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+
+    let rc = unsafe {
+        libc::getpwnam_r(
+            cname.as_ptr(),
+            &mut entry,
+            buffer.as_mut_ptr() as *mut libc::c_char,
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 || result.is_null() {
+        return None;
     }
+    copy_passwd(&entry)
 }
 
 #[cfg(not(unix))]
@@ -38,19 +67,23 @@ fn account_from_name(_name: &str) -> Option<AdminAccount> {
 
 #[cfg(unix)]
 fn account_from_uid(uid: u32) -> Option<AdminAccount> {
-    unsafe {
-        let pwd = libc::getpwuid(uid);
-        if pwd.is_null() {
-            return None;
-        }
-        let entry = &*pwd;
-        Some(AdminAccount {
-            name: CStr::from_ptr(entry.pw_name).to_string_lossy().to_string(),
-            uid: entry.pw_uid,
-            gid: entry.pw_gid,
-            home: PathBuf::from(CStr::from_ptr(entry.pw_dir).to_string_lossy().to_string()),
-        })
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buffer = vec![0u8; PASSWD_BUFFER_SIZE];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+
+    let rc = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut entry,
+            buffer.as_mut_ptr() as *mut libc::c_char,
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 || result.is_null() {
+        return None;
     }
+    copy_passwd(&entry)
 }
 
 #[cfg(not(unix))]
@@ -790,5 +823,15 @@ mod tests {
         assert!(lock_dir(dir.path()).is_err());
         drop(first);
         assert!(lock_dir(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn account_lookups_are_thread_safe() {
+        let handles: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(|| account_from_name("root").map(|account| account.uid)))
+            .collect();
+        for handle in handles {
+            assert_eq!(handle.join().unwrap(), Some(0));
+        }
     }
 }
