@@ -213,6 +213,92 @@ mod tests {
         assert!(rune.is_some(), "Whitespace rune passes extraction (CLN validates)");
     }
 
+    // --- Rune alteration tests ---
+
+    #[test]
+    fn rune_alteration_preserves_extraction() {
+        let original = "02EqX-6Tcv4I5aO5PSG9vHRqCCbERqSJJvXE7jYVj1O1c9Mzc=";
+        let mut altered_bytes = original.as_bytes().to_vec();
+        // Alter the last character before '='
+        if let Some(pos) = altered_bytes.iter().position(|&b| b == b'=') {
+            altered_bytes[pos - 1] = b'X';
+        }
+        let altered = String::from_utf8(altered_bytes).unwrap();
+
+        let req_orig = request_with_rune(original);
+        let req_alt = request_with_rune(&altered);
+
+        // Both should be extracted (validation is CLN's responsibility)
+        assert_eq!(extract_rune_from_request(&req_orig), Some(original.into()));
+        assert_eq!(extract_rune_from_request(&req_alt), Some(altered.clone().into()));
+        // But they should be different strings
+        assert_ne!(original, altered.as_str());
+    }
+
+    #[test]
+    fn rune_altered_hmac_differs_from_original() {
+        let original = "Q0FXzkB9DzGSJwBEjW9RwTGSfdh_i3e2Xz9O4cM1JDU=";
+        // Replace a character that actually exists in the rune
+        let altered = original.replace("D", "X");
+        // Ensure alteration actually changed the string
+        assert_ne!(original, altered.as_str());
+        // Both should still be extractable
+        assert_eq!(
+            extract_rune_from_request(&request_with_rune(original)),
+            Some(original.into())
+        );
+        assert_eq!(
+            extract_rune_from_request(&request_with_rune(&altered)),
+            Some(altered.into())
+        );
+    }
+
+    // --- Rune format structure tests ---
+
+    #[test]
+    fn rune_valid_base64url_format() {
+        // CLN runes use base64url encoding (no padding '=' at end sometimes)
+        let valid_runes = vec![
+            "Q0FXzkB9DzGSJwBEjW9RwTGSfdh_i3e2Xz9O4cM1JDU",
+            "02EqX-6Tcv4I5aO5PSG9vHRqCCbERqSJJvXE7jYVj1O1c9Mzc=",
+            "dGVzdC1ydW5lLXZhbGlk",
+        ];
+        for rune in valid_runes {
+            let req = request_with_rune(rune);
+            assert_eq!(
+                extract_rune_from_request(&req),
+                Some(rune.into()),
+                "Valid rune should be extracted: {}",
+                rune
+            );
+        }
+    }
+
+    #[test]
+    fn rune_with_restrictions_format() {
+        // Rune with restriction structure: {id}/{restrictions}/{hmac}
+        // Therestriction part uses '=' and '&' separators
+        let rune_with_restrictions = "Q0FXzkB9DzGSJwBEjW9RwTGSfdh_i3e2Xz9O4cM1JDU";
+        let req = request_with_rune(rune_with_restrictions);
+        assert_eq!(
+            extract_rune_from_request(&req),
+            Some(rune_with_restrictions.into())
+        );
+    }
+
+    #[test]
+    fn rune_empty_string_is_rejected() {
+        let req = request_with_rune("");
+        assert_eq!(extract_rune_from_request(&req), None);
+    }
+
+    #[test]
+    fn rune_whitespace_only_is_extracted_but_cln_validates() {
+        // Whitespace passes our filter, but CLN's check_rune will reject it
+        let req = request_with_rune("   ");
+        assert!(extract_rune_from_request(&req).is_some());
+    }
+
     // --- Metadata key case sensitivity tests ---
 
     #[test]
