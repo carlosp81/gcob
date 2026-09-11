@@ -35,7 +35,7 @@ pub(crate) async fn validate_rune(
 ) -> Result<(), Status> {
     let check_request = cln_api::CheckruneRequest {
         rune: rune.to_string(),
-        nodeid: None,
+        nodeid: Some(client.node_id.clone()),
         method: Some(method.to_string()),
         params,
     };

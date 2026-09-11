@@ -65,6 +65,7 @@ Client Request
 | `src/events/subscribers/invoice.rs` | +`expiry: None` |
 | `src/events/enricher.rs` | +`expiry: None` in test |
 | `src/domain/invoice/watch.rs` | +`expiry` in proto conversion |
+| `src/cln/client.rs` | +`node_id: String`, fetch via `getinfo` in `connect()` |
 | `src/grpc/node_service.rs` | -99 lines auth boilerplate, +rate limiting kept |
 | `src/grpc/interceptors/auth.rs` | +27 tests (19 original + 6 rune alteration/format + 2 whitespace) |
 | `src/grpc/interceptors/auth_layer.rs` | **NEW**: tower Layer + Service middleware |
@@ -145,7 +146,7 @@ The fix: Always create runes with restrictions using `lightning-cli createrune -
 
 | # | Task | Status | Notes |
 |---|------|--------|-------|
-| 4 | **Pass nodeid to `check_rune`** (M-1) | NOT DONE | `auth.rs:37` sends `nodeid: None`. Should cache CLN node ID from `getinfo` and verify rune belongs to this node. |
+| 4 | **Pass nodeid to `check_rune`** (M-1) | **DONE** (commit pending) | `ClnClient` caches node ID from `getinfo`. `validate_rune` now sends `nodeid: Some(client.node_id.clone())`. |
 | 5 | **Remove dead code: `extract_rune_from_request`** | NOT DONE | Now unused in production code (only used in tests). Either make `#[cfg(test)]` or remove. |
 | 6 | **Update v0.4.1 changelog and tag** | NOT DONE | Need to add security fixes to changelog and create new tag. |
 
@@ -166,7 +167,7 @@ The fix: Always create runes with restrictions using `lightning-cli createrune -
 | C-1 | 5 streaming RPCs had no rune auth | CRITICAL | **FIXED** (commit `f2464ef`) |
 | H-1 | No tonic interceptor, auth was manual | HIGH | **FIXED** (commit `da60e16`) |
 | H-2 | Rune `params` restrictions bypassed | HIGH | **FIXED** (commit `5c5c17d`) |
-| M-1 | Rune `nodeid` not verified | MEDIUM | **NOT DONE** |
+| M-1 | Rune `nodeid` not verified | MEDIUM | **FIXED** (commit pending) |
 | M-2 | Rate limiter bypassed when Valkey down | MEDIUM | **FIXED** (commit pending) |
 | L-1 | 5 watch RPCs also lack rate limiting | LOW | **NOT DONE** (low priority) |
 
