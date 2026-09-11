@@ -18,8 +18,6 @@ pub struct ClnConfig {
 
 impl ClnConfig {
     pub fn from_env() -> Result<Self, Status> {
-        dotenvy::dotenv().ok();
-
         let cert_dir = env::var("CLN_CERT_DIR")
             .map(PathBuf::from)
             .map_err(|_| Status::failed_precondition("CLN_CERT_DIR must be set"))?;
@@ -73,12 +71,19 @@ impl ClnConfig {
     pub fn validate_user() -> Result<(), Status> {
         #[cfg(unix)]
         {
-            let user = env::var("USER").unwrap_or_default();
-            if user != "gcob" {
-                return Err(Status::permission_denied(format!(
-                    "Only user 'gcob' can start the API. Current: '{}'",
-                    user
-                )));
+            match crate::certs::paths::is_gcob_user() {
+                Ok(true) => {}
+                Ok(false) => {
+                    return Err(Status::permission_denied(
+                        "Only user 'gcob' can start the API",
+                    ));
+                }
+                Err(e) => {
+                    return Err(Status::permission_denied(format!(
+                        "Cannot verify service user: {}",
+                        e
+                    )));
+                }
             }
         }
         Ok(())

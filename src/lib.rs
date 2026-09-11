@@ -1,5 +1,6 @@
-pub mod cln;
 pub mod certs;
+pub mod cln;
+pub mod config;
 pub mod domain;
 pub mod events;
 pub mod grpc;
