@@ -1367,6 +1367,52 @@ mod tests {
         assert!(format!("{err}").contains("symlink"), "{err}");
     }
 
+    /// AV-008: a racing symlink swap must never redirect the read to the
+    /// victim file. `O_NOFOLLOW` makes the open fail with `ELOOP` while the
+    /// path is a symlink; a successful read can only return the regular
+    /// file's content.
+    #[test]
+    fn read_secure_file_symlink_race_never_reads_victim() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.pem");
+        let victim = dir.path().join("victim.pem");
+        std::fs::write(&path, b"ORIGINAL").unwrap();
+        std::fs::write(&victim, b"VICTIM").unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let attacker = {
+            let path = path.clone();
+            let victim = victim.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = std::fs::remove_file(&path);
+                    if std::os::unix::fs::symlink(&victim, &path).is_ok() {
+                        let _ = std::fs::remove_file(&path);
+                    }
+                    let _ = std::fs::write(&path, b"ORIGINAL");
+                }
+            })
+        };
+
+        for _ in 0..2000 {
+            // ELOOP (symlink) or NotFound (swap window) are both safe errors.
+            if let Ok(bytes) = read_secure_file(&path, false) {
+                assert!(
+                    !bytes.windows(b"VICTIM".len()).any(|w| w == b"VICTIM"),
+                    "symlink swap redirected the read to the victim file: {bytes:?}"
+                );
+            }
+        }
+
+        stop.store(true, Ordering::Relaxed);
+        attacker.join().unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"VICTIM");
+    }
+
     #[test]
     fn read_secure_file_rejects_directory() {
         let dir = tempfile::tempdir().unwrap();

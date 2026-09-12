@@ -1,3 +1,4 @@
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -16,12 +17,68 @@ use crate::grpc::interceptors::identity::ClientIdentityLayer;
 use crate::grpc::interceptors::rate_limit_layer::RateLimitLayer;
 use crate::grpc::interceptors::rate_limiter::InMemoryRateLimiter;
 use crate::grpc::limits::Limits;
-use crate::grpc::stream_limits::StreamLimits;
+use crate::grpc::stream_limits::{StreamLimits, IDLE_CLIENT_CLEANUP_INTERVAL};
+
+/// Interval between availability snapshots emitted as structured logs.
+const AVAILABILITY_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(60);
 
 pub struct ApiService {
     pub client: Arc<ClnClient>,
     pub event_router: Arc<EventRouter>,
     pub stream_limits: Arc<StreamLimits>,
+}
+
+/// Point-in-time availability gauges emitted periodically by `gcob serve`.
+///
+/// Read-only snapshot: it takes existing atomic/under-lock values and never
+/// holds a lock across an await beyond the router's own read lock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AvailabilitySnapshot {
+    active_streams: usize,
+    tracked_clients: usize,
+    idle_clients: usize,
+    subscribers: usize,
+    events_dispatched: u64,
+    events_delivered: u64,
+    events_dropped: u64,
+    subscribers_dropped: u64,
+    fallback_buckets: usize,
+}
+
+impl AvailabilitySnapshot {
+    async fn collect(
+        limits: &StreamLimits,
+        router: &EventRouter,
+        fallback: &InMemoryRateLimiter,
+    ) -> Self {
+        let stats = router.stats();
+        Self {
+            active_streams: limits.active_streams(),
+            tracked_clients: limits.tracked_clients(),
+            idle_clients: limits.idle_clients(),
+            subscribers: router.total_subscribers().await,
+            events_dispatched: stats.events_dispatched.load(Ordering::Relaxed),
+            events_delivered: stats.events_delivered.load(Ordering::Relaxed),
+            events_dropped: stats.events_dropped.load(Ordering::Relaxed),
+            subscribers_dropped: stats.subscribers_dropped.load(Ordering::Relaxed),
+            fallback_buckets: fallback.tracked_keys().await,
+        }
+    }
+
+    fn emit(&self) {
+        tracing::info!(
+            active_streams = self.active_streams,
+            tracked_clients = self.tracked_clients,
+            idle_clients = self.idle_clients,
+            subscribers = self.subscribers,
+            events_dispatched = self.events_dispatched,
+            events_delivered = self.events_delivered,
+            events_dropped = self.events_dropped,
+            subscribers_dropped = self.subscribers_dropped,
+            fallback_buckets = self.fallback_buckets,
+            "availability snapshot"
+        );
+    }
 }
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -81,13 +138,49 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    // --- Stream limits + idle-client reclamation ---
+    //
+    // The per-client map is keyed by certificate fingerprint; without cleanup
+    // it would retain one semaphore per fingerprint ever seen. `cleanup_idle`
+    // only removes entries with no active stream and no in-flight acquire.
+    let stream_limits = StreamLimits::new(
+        limits.max_active_streams_global,
+        limits.max_active_streams_per_client,
+    );
+    let cleanup_limits = stream_limits.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(IDLE_CLIENT_CLEANUP_INTERVAL);
+        loop {
+            interval.tick().await;
+            let removed = cleanup_limits.cleanup_idle();
+            if removed > 0 {
+                tracing::debug!(removed, "Removed idle stream-limit client entries");
+            }
+        }
+    });
+
+    // --- Periodic availability snapshot ---
+    //
+    // Emits gauges that the availability invariants are checked against
+    // (streams, tracked clients, subscribers, router stats, fallback buckets)
+    // without adding any network endpoint.
+    let snapshot_limits = stream_limits.clone();
+    let snapshot_router = router.clone();
+    let snapshot_fallback = in_memory_limiter.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(AVAILABILITY_SNAPSHOT_INTERVAL);
+        loop {
+            interval.tick().await;
+            AvailabilitySnapshot::collect(&snapshot_limits, &snapshot_router, &snapshot_fallback)
+                .await
+                .emit();
+        }
+    });
+
     let api_service = ApiService {
         client: Arc::new(client),
         event_router: router,
-        stream_limits: StreamLimits::new(
-            limits.max_active_streams_global,
-            limits.max_active_streams_per_client,
-        ),
+        stream_limits,
     };
 
     tracing::info!("gRPC API server listening on {}", addr);
@@ -150,4 +243,63 @@ async fn shutdown_signal(bridge_handle: tokio::task::JoinHandle<()>) {
 
     tracing::info!("Shutdown signal received, starting graceful shutdown");
     bridge_handle.abort();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::types::Event;
+    use crate::grpc::interceptors::rate_limiter::PAYMENT_POLICY;
+    use tokio::sync::mpsc;
+
+    #[tokio::test]
+    async fn availability_snapshot_reflects_current_state() {
+        let limits = StreamLimits::new(10, 2);
+        let router = EventRouter::new();
+        let fallback = InMemoryRateLimiter::new();
+
+        let _permit = limits.acquire("cert-a").unwrap();
+        let (tx, _rx) = mpsc::channel::<Event>(4);
+        router
+            .subscribe("payment", "sub-1".into(), tx)
+            .await
+            .unwrap();
+        assert!(fallback.check("key", PAYMENT_POLICY).await);
+
+        let snapshot = AvailabilitySnapshot::collect(&limits, &router, &fallback).await;
+        assert_eq!(snapshot.active_streams, 1);
+        assert_eq!(snapshot.tracked_clients, 1);
+        assert_eq!(snapshot.idle_clients, 0);
+        assert_eq!(snapshot.subscribers, 1);
+        assert_eq!(snapshot.fallback_buckets, 1);
+        assert_eq!(snapshot.events_dispatched, 0);
+        assert_eq!(snapshot.subscribers_dropped, 0);
+    }
+
+    #[tokio::test]
+    async fn availability_snapshot_returns_to_baseline() {
+        let limits = StreamLimits::new(10, 2);
+        let router = EventRouter::new();
+        let fallback = InMemoryRateLimiter::new();
+
+        drop(limits.acquire("cert-a").unwrap());
+        limits.cleanup_idle();
+
+        let snapshot = AvailabilitySnapshot::collect(&limits, &router, &fallback).await;
+        assert_eq!(snapshot.active_streams, 0);
+        assert_eq!(snapshot.tracked_clients, 0);
+        assert_eq!(snapshot.idle_clients, 0);
+        assert_eq!(snapshot.subscribers, 0);
+        assert_eq!(snapshot.fallback_buckets, 0);
+    }
+
+    #[tokio::test]
+    async fn availability_snapshot_emit_is_safe_without_subscriber() {
+        let limits = StreamLimits::new(1, 1);
+        let router = EventRouter::new();
+        let fallback = InMemoryRateLimiter::new();
+        AvailabilitySnapshot::collect(&limits, &router, &fallback)
+            .await
+            .emit();
+    }
 }

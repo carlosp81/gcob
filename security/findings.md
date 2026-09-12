@@ -2,6 +2,10 @@
 
 Revisión estática original: commit `2e6e01e`. Estado tras Fases 0–5.
 
+Validación automatizada 0.5.4: `security/availability-validation.md` (suite,
+`cargo deny check` y `cargo audit` en verde; laboratorio con CLN real
+pendiente).
+
 ## Matriz de hallazgos
 
 | ID | Hallazgo | Severidad | Estado | Commit(s) | Regresión |
@@ -13,10 +17,14 @@ Revisión estática original: commit `2e6e01e`. Estado tras Fases 0–5.
 | GCOB-005 | `await` bajo `RwLock` en el router | Media/Alta | **Cerrado** | `33d4dcd` | `dispatch_does_not_block_on_full_subscriber` |
 | GCOB-006 | Fan-out O(N) de eventos | Media/Alta | **Mitigado** | `33d4dcd`, `ce96a29` | `stats_track_delivered_and_dropped`, cotas de subscribers |
 | GCOB-007 | Body completo antes de autorizar | Media/Alta | **Cerrado** | `7dae27f` | `oversized_body_is_rejected_before_any_backend_call`, e2e mTLS |
-| GCOB-008 | Sin límite de conexiones/streams | Media/Alta | **Parcial** | `7dae27f` | `max_concurrent_streams` + concurrencia por conexión; falta cap global por IP |
+| GCOB-008 | Sin límite de conexiones/streams | Media/Alta | **Parcial (documentado)** | `7dae27f` | `max_concurrent_streams` + concurrencia por conexión; el cap global de conexiones queda en HAProxy/OS por decisión (ver riesgos residuales) |
 | GCOB-009 | TOCTOU en operaciones de filesystem | Media | **Cerrado (servidor)** | `50f1325`, `36751ea` | `read_secure_file_rejects_symlink`, `validate_cln_source_rejects_*` |
 | GCOB-010 | Dependencias sin auditoría continua | Media | **Cerrado** | `63a3bf4`, `e981976` | `cargo-deny` en CI + Dependabot |
 | GCOB-011 | Orden de capas invertido (nuevo, Fase 5) | Crítica | **Cerrado** | `952e065` | `src/grpc/e2e_tests.rs` (4 tests mTLS) |
+| GCOB-012 | Atomicidad de `StreamLimits` bajo alta concurrencia (validación) | Informativo | **Cerrado (T4)** | — | `stream_limits_concurrent_acquire_is_bounded`; soak `stream_limits_soak_returns_to_baseline` |
+| GCOB-013 | `per_client` retiene entradas inactivas (nuevo) | Baja/Media | **Cerrado (T1–T3)** | — | `cleanup_idle_removes_inactive_clients`; `cleanup_keeps_client_with_outstanding_clone`; tarea de 300 s en `server.rs` |
+| GCOB-014 | Eviction del router O(N·M) por `Vec::contains` (nuevo) | Baja | **Cerrado (T5)** | — | `dispatch_removes_dead_subscribers_without_quadratic_scan` |
+| GCOB-015 | Fan-out clona `Event` por subscriber (O(N)) (nuevo) | Baja | **Cerrado (T7, diferido)** | — | Benchmark `fanout_dispatch_bench`: 512 subscribers × 200 eventos ≈ 1 320 ns/entrega; no compensa `Arc<Event>` por ahora |
 
 ### GCOB-011 — detalle
 
@@ -59,14 +67,34 @@ Precondición: certificado mTLS válido, rune válida o inválida.
 ## Riesgos residuales
 
 1. **GCOB-008**: no hay tope global de conexiones ni por IP (tonic no lo expone
-   directamente); queda HAProxy/OS como barrera. Candidato a accept-loop propio.
-2. **GCOB-006**: `Arc<Event>` (fan-out O(1)) no implementado; se decidirá con el
-   benchmark de laboratorio. El descarte de eventos para consumidores lentos es
-   intencional y está documentado.
-3. **GCOB-009**: `gcob-client` (herramienta local) conserva `fs::read` para
+   directamente). Decisión: queda en HAProxy/OS como barrera (no se implementa
+   accept-loop propio en gcob). Si en el futuro se necesita defensa en
+   profundidad a nivel de proceso, el diseño candidato es envolver
+   `TcpIncoming` con un semáforo por conexión (`GCOB_MAX_CONNECTIONS`).
+2. **GCOB-013**: el mapa `per_client` de `StreamLimits` retiene una entrada por
+   fingerprint vista. Se mitiga con `cleanup_idle()` (guard
+   `Arc::strong_count == 1 && available == max` bajo el lock) y una tarea
+   periódica de 300 s.
+3. **GCOB-006/015**: `Arc<Event>` (fan-out O(1)) no implementado; se decidirá
+   con el benchmark de laboratorio. El descarte de eventos para consumidores
+   lentos es intencional y está documentado.
+4. **GCOB-009**: `gcob-client` (herramienta local) conserva `fs::read` para
    rutas provistas por el usuario; no es superficie de red.
-4. **Validación contra CLN real**: la suite e2e usa un backend inalcanzable para
+5. **Validación contra CLN real**: la suite e2e usa un backend inalcanzable para
    `check_rune`; el procedimiento de laboratorio de
    `availability-invariants.md` cubre el caso con nodo real.
-5. `x-client-id` solo es auditable cuando el cliente lo envía; la identidad de
+6. `x-client-id` solo es auditable cuando el cliente lo envía; la identidad de
    seguridad no depende de él.
+
+## Plan de validación (AV) y trazabilidad
+
+| AV | Propiedad | Test | Estado |
+|---|---|---|---|
+| AV-001 | Aislamiento de identidad (mismo cert ⇒ mismo bucket) | `spoofed_claims_share_one_certificate_budget_over_mtls`, `different_certificates_have_independent_budgets_over_mtls` | Existente |
+| AV-002 | Amplificación pre-auth de `check_rune` | `preauth_budget_caps_backend_attempts`, `preauth_budget_cuts_before_rune_validation_over_mtls` | Existente |
+| AV-003 | Concurrencia de streams acotada y atómica | `stream_limits_concurrent_acquire_is_bounded` (T4) + soak nightly | Cerrado |
+| AV-004 | Ciclo de vida de streams (desconexión libera) | `client_disconnect_unsubscribes_and_releases_permit`, `repeated_open_and_abandon_returns_to_baseline` | Existente |
+| AV-005 | Slow subscriber no bloquea el dispatch | `dispatch_does_not_block_on_full_subscriber`, `slow_subscriber_is_dropped_after_max_consecutive_drops` | Existente |
+| AV-006 | Cotas de subscribers (global/tipo) | `subscribe_enforces_global_limit`, `subscribe_enforces_per_type_limit` | Existente |
+| AV-007 | Límites HTTP/2 bajo carga | `http2_max_concurrent_streams_bounds_active_streams` (T8) | Cerrado |
+| AV-008 | Carrera symlink/TOCTOU en lectura de certificados | `read_secure_file_symlink_race_never_reads_victim` (T9) | Cerrado |

@@ -1,0 +1,25 @@
+name: Nightly availability soak
+
+on:
+  schedule:
+    # 03:17 UTC to avoid the top-of-the-hour runner peak.
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  soak:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Runs the `#[ignore]` stress/benchmark tests too: the StreamLimits soak
+      # with a concurrent cleaner and the fan-out benchmark (GCOB-012/015).
+      - name: Soak and benchmark (ignored tests included)
+        run: cargo test --locked -- --include-ignored

@@ -264,7 +264,7 @@ mod tests {
         assert_eq!(admitted, 1_000, "10 certificates x 100 budget");
         assert_eq!(calls.load(Ordering::SeqCst), 1_000);
         assert_eq!(
-            fallback.bucket_count().await,
+            fallback.tracked_keys().await,
             10,
             "spoofed claims must not create additional buckets"
         );

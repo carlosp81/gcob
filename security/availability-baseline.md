@@ -26,11 +26,15 @@ No usar nodos productivos. Registrar en `baseline.json`:
 | latencia p50/p95/p99 | loadgen | `hdrhistogram`/salida del harness |
 | requests/s, errores | loadgen | resumen del harness |
 | conexiones activas, streams HTTP/2 | `ss -tnp`, métricas del servidor | `ss` |
-| subscribers activos | log periódico del router | tracing |
+| subscribers activos | snapshot de disponibilidad (60 s) | tracing |
 | `check_rune/s` | contador del bridge / logs | tracing |
-| descartes de subscriber | contador del router | tracing |
+| descartes de subscriber | snapshot de disponibilidad (60 s) | tracing |
 | rate-limit rejects | contador de capa | tracing |
 | tamaño de body aceptado | logs de rechazo | tracing |
+
+El snapshot de disponibilidad (`server.rs`, cada 60 s) emite además
+`active_streams`, `tracked_clients`, `idle_clients`, `fallback_buckets` y los
+contadores `events_dispatched/delivered/dropped`, `subscribers_dropped`.
 
 ## Carga legítima inicial
 

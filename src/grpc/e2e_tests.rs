@@ -14,6 +14,7 @@ use tonic::transport::{
     Certificate, Channel, ClientTlsConfig, Endpoint, Identity, Server, ServerTlsConfig,
 };
 use tonic::{Request, Response, Status};
+use tower::{Layer, Service};
 
 use crate::cln::client::ClnClient;
 use crate::cln::cln_api;
@@ -28,8 +29,28 @@ use crate::grpc::limits::Limits;
 
 // --- Fake backend ---
 
-#[derive(Clone)]
-struct FakeNodeServices;
+/// Tracks concurrent `watch_channels` invocations for the HTTP/2 stream-limit
+/// test. `None` means the method stays unimplemented for other tests.
+#[derive(Clone, Default)]
+struct StreamHold {
+    active: Arc<std::sync::atomic::AtomicUsize>,
+    max_active: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl StreamHold {
+    fn active(&self) -> usize {
+        self.active.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn max_active(&self) -> usize {
+        self.max_active.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+#[derive(Clone, Default)]
+struct FakeNodeServices {
+    hold: Option<StreamHold>,
+}
 
 #[tonic::async_trait]
 impl NodeServices for FakeNodeServices {
@@ -96,7 +117,27 @@ impl NodeServices for FakeNodeServices {
         &self,
         _request: Request<()>,
     ) -> Result<Response<Self::WatchChannelsStream>, Status> {
-        unimplemented!("not exercised by the availability tests")
+        let Some(hold) = &self.hold else {
+            unimplemented!("not exercised by the availability tests")
+        };
+
+        // Count the handler as active until the client drops the response
+        // stream (`tx.closed()`), then release the slot.
+        let current = hold
+            .active
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        hold.max_active
+            .fetch_max(current, std::sync::atomic::Ordering::SeqCst);
+
+        let (tx, rx) = tokio::sync::mpsc::channel::<Result<cln_api::Event, Status>>(1);
+        let active = hold.active.clone();
+        tokio::spawn(async move {
+            tx.closed().await;
+            active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 
     type WatchPeersStream = ReceiverStream<Result<cln_api::Event, Status>>;
@@ -246,7 +287,7 @@ async fn spoofed_claims_share_one_certificate_budget_over_mtls() {
         // First layer added is the outermost.
         .layer(ClientIdentityLayer::new())
         .layer(RateLimitLayer::new(None, InMemoryRateLimiter::new()))
-        .add_service(NodeServicesServer::new(FakeNodeServices));
+        .add_service(NodeServicesServer::new(FakeNodeServices::default()));
     let handle = tokio::spawn(async move {
         let _ = server
             .serve_with_incoming(TcpIncoming::from(listener))
@@ -278,7 +319,7 @@ async fn different_certificates_have_independent_budgets_over_mtls() {
         // First layer added is the outermost.
         .layer(ClientIdentityLayer::new())
         .layer(RateLimitLayer::new(None, InMemoryRateLimiter::new()))
-        .add_service(NodeServicesServer::new(FakeNodeServices));
+        .add_service(NodeServicesServer::new(FakeNodeServices::default()));
     let handle = tokio::spawn(async move {
         let _ = server
             .serve_with_incoming(TcpIncoming::from(listener))
@@ -326,7 +367,7 @@ async fn preauth_budget_cuts_before_rune_validation_over_mtls() {
         .layer(ClientIdentityLayer::new())
         .layer(admission)
         .layer(auth)
-        .add_service(NodeServicesServer::new(FakeNodeServices));
+        .add_service(NodeServicesServer::new(FakeNodeServices::default()));
     let handle = tokio::spawn(async move {
         let _ = server
             .serve_with_incoming(TcpIncoming::from(listener))
@@ -370,7 +411,7 @@ async fn oversized_body_is_rejected_over_mtls() {
         // First layer added is the outermost.
         .layer(ClientIdentityLayer::new())
         .layer(auth)
-        .add_service(NodeServicesServer::new(FakeNodeServices));
+        .add_service(NodeServicesServer::new(FakeNodeServices::default()));
     let handle = tokio::spawn(async move {
         let _ = server
             .serve_with_incoming(TcpIncoming::from(listener))
@@ -409,4 +450,366 @@ fn xpay_request_with_body(body: cln_api::XpayRequest) -> Request<cln_api::XpayRe
         .metadata_mut()
         .insert("x-rune", "test-rune".parse().unwrap());
     request
+}
+
+// --- Mock CLN backend: captures the exact `check_rune` payload (Fase 4) ---
+
+#[derive(Clone)]
+struct MockCln {
+    valid: bool,
+    last: Arc<tokio::sync::Mutex<Option<cln_api::CheckruneRequest>>>,
+}
+
+impl MockCln {
+    fn new(valid: bool) -> Self {
+        Self {
+            valid,
+            last: Arc::new(tokio::sync::Mutex::new(None)),
+        }
+    }
+
+    async fn last_request(&self) -> cln_api::CheckruneRequest {
+        self.last
+            .lock()
+            .await
+            .clone()
+            .expect("check_rune must have been called")
+    }
+}
+
+impl tonic::server::NamedService for MockCln {
+    const NAME: &'static str = "cln.Node";
+}
+
+impl tower::Service<http::Request<tonic::body::Body>> for MockCln {
+    type Response = http::Response<tonic::body::Body>;
+    type Error = std::convert::Infallible;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: http::Request<tonic::body::Body>) -> Self::Future {
+        let valid = self.valid;
+        let last = self.last.clone();
+
+        Box::pin(async move {
+            if req.uri().path() == "/cln.Node/CheckRune" {
+                use http_body_util::BodyExt;
+                use prost::Message;
+
+                let body = req
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("request body")
+                    .to_bytes();
+                if let Some(payload) = grpc_payload(&body) {
+                    let request =
+                        cln_api::CheckruneRequest::decode(payload).expect("CheckruneRequest");
+                    *last.lock().await = Some(request);
+                }
+            }
+            Ok(grpc_unary_ok(cln_api::CheckruneResponse { valid }))
+        })
+    }
+}
+
+/// Extract the protobuf payload from an uncompressed gRPC frame.
+fn grpc_payload(body: &[u8]) -> Option<&[u8]> {
+    if body.len() < 5 || body[0] != 0 {
+        return None;
+    }
+    let len = u32::from_be_bytes(body[1..5].try_into().ok()?) as usize;
+    body.get(5..5 + len)
+}
+
+/// Build a unary gRPC response with the status in the trailers.
+fn grpc_unary_ok<M: prost::Message>(message: M) -> http::Response<tonic::body::Body> {
+    let mut payload = Vec::new();
+    message.encode(&mut payload).expect("encode response");
+
+    let mut framed = Vec::with_capacity(5 + payload.len());
+    framed.push(0u8);
+    framed.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    framed.extend_from_slice(&payload);
+
+    let mut trailers = http::HeaderMap::new();
+    trailers.insert("grpc-status", http::HeaderValue::from_static("0"));
+
+    let frames = tokio_stream::iter(vec![
+        Ok::<_, std::convert::Infallible>(http_body::Frame::data(bytes::Bytes::from(framed))),
+        Ok(http_body::Frame::trailers(trailers)),
+    ]);
+
+    http::Response::builder()
+        .status(200)
+        .header("content-type", "application/grpc")
+        .body(tonic::body::Body::new(http_body_util::StreamBody::new(
+            frames,
+        )))
+        .expect("response")
+}
+
+async fn start_mock_cln(mock: MockCln) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let handle = tokio::spawn(async move {
+        let _ = Server::builder()
+            .add_service(mock)
+            .serve_with_incoming(TcpIncoming::from(listener))
+            .await;
+    });
+    (addr, handle)
+}
+
+fn connected_cln(addr: SocketAddr, node_id: &str) -> Arc<ClnClient> {
+    let channel = Endpoint::from_shared(format!("http://127.0.0.1:{}", addr.port()))
+        .unwrap()
+        .connect_lazy();
+    Arc::new(ClnClient {
+        inner: cln_api::node_client::NodeClient::new(channel),
+        node_id: node_id.to_string(),
+    })
+}
+
+#[derive(Clone)]
+struct CountingInner {
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl CountingInner {
+    fn new() -> (Self, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (
+            Self {
+                calls: calls.clone(),
+            },
+            calls,
+        )
+    }
+}
+
+impl tower::Service<http::Request<tonic::body::Body>> for CountingInner {
+    type Response = http::Response<tonic::body::Body>;
+    type Error = std::convert::Infallible;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(
+        &mut self,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _req: http::Request<tonic::body::Body>) -> Self::Future {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async {
+            Ok(http::Response::new(tonic::body::Body::new(
+                http_body_util::Full::new(bytes::Bytes::new()),
+            )))
+        })
+    }
+}
+
+fn auth_request_for(path: &str, body: bytes::Bytes) -> http::Request<tonic::body::Body> {
+    let mut req = http::Request::new(tonic::body::Body::new(http_body_util::Full::new(body)));
+    req.headers_mut()
+        .insert("x-rune", "test-rune".parse().unwrap());
+    *req.uri_mut() = path.parse().unwrap();
+    req
+}
+
+/// Fase 4: the exact payload sent to CLN `check_rune` (method, params and
+/// node id) is asserted per endpoint through a mock CLN backend.
+#[tokio::test]
+async fn check_rune_receives_method_params_and_node_id() {
+    let mock = MockCln::new(true);
+    let (addr, handle) = start_mock_cln(mock.clone()).await;
+    let cln = connected_cln(addr, "node-under-test");
+
+    let (inner, calls) = CountingInner::new();
+    let mut service = AuthLayer::new(cln, 262_144).layer(inner);
+
+    // Getinfo: no params.
+    let response = service
+        .call(auth_request_for(
+            "/cln.NodeServices/Getinfo",
+            bytes::Bytes::new(),
+        ))
+        .await
+        .unwrap();
+    assert!(
+        response.headers().get("grpc-status").is_none(),
+        "valid rune must pass through"
+    );
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let captured = mock.last_request().await;
+    assert_eq!(captured.rune, "test-rune");
+    assert_eq!(captured.nodeid.as_deref(), Some("node-under-test"));
+    assert_eq!(captured.method.as_deref(), Some("getinfo"));
+    assert!(captured.params.is_empty());
+
+    // Invoice: amount, label and description are the rune-restriction params.
+    use prost::Message;
+    let invoice = cln_api::InvoiceRequest {
+        amount_msat: Some(cln_api::AmountOrAny {
+            value: Some(cln_api::amount_or_any::Value::Amount(cln_api::Amount {
+                msat: 50000,
+            })),
+        }),
+        label: "label-1".to_string(),
+        description: "desc".to_string(),
+        ..Default::default()
+    };
+    let mut body = Vec::new();
+    invoice.encode(&mut body).unwrap();
+
+    let response = service
+        .call(auth_request_for(
+            "/cln.NodeServices/Invoice",
+            bytes::Bytes::from(body),
+        ))
+        .await
+        .unwrap();
+    assert!(response.headers().get("grpc-status").is_none());
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+    let captured = mock.last_request().await;
+    assert_eq!(captured.method.as_deref(), Some("invoice"));
+    assert_eq!(captured.params, vec!["50000", "label-1", "desc"]);
+    assert_eq!(captured.rune, "test-rune");
+
+    handle.abort();
+}
+
+/// Fase 4: an invalid rune response from CLN rejects the request without
+/// reaching the inner handler, and the payload was still captured.
+#[tokio::test]
+async fn invalid_rune_is_rejected_after_check_rune() {
+    let mock = MockCln::new(false);
+    let (addr, handle) = start_mock_cln(mock.clone()).await;
+    let cln = connected_cln(addr, "node-under-test");
+
+    let (inner, calls) = CountingInner::new();
+    let mut service = AuthLayer::new(cln, 262_144).layer(inner);
+
+    let response = service
+        .call(auth_request_for(
+            "/cln.NodeServices/Getinfo",
+            bytes::Bytes::new(),
+        ))
+        .await
+        .unwrap();
+
+    assert_eq!(response.headers().get("grpc-status").unwrap(), "16");
+    assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+    let captured = mock.last_request().await;
+    assert_eq!(captured.method.as_deref(), Some("getinfo"));
+    assert_eq!(captured.nodeid.as_deref(), Some("node-under-test"));
+
+    handle.abort();
+}
+
+// --- AV-007: HTTP/2 max_concurrent_streams bound (Fase C) ---
+
+fn watch_channels_request() -> Request<()> {
+    let mut request = Request::new(());
+    request
+        .metadata_mut()
+        .insert("x-rune", "test-rune".parse().unwrap());
+    request
+}
+
+/// With `max_concurrent_streams = 1`, opening many concurrent streaming RPCs
+/// must never run more than one handler at a time, and dropping the clients
+/// must release every active handler.
+#[tokio::test]
+async fn http2_max_concurrent_streams_bounds_active_streams() {
+    let pki = generate_pki(1);
+
+    // Valid rune so the request passes AuthLayer and reaches the service.
+    let mock = MockCln::new(true);
+    let (mock_addr, mock_handle) = start_mock_cln(mock).await;
+    let cln = connected_cln(mock_addr, "node-under-test");
+
+    let hold = StreamHold::default();
+    let service = FakeNodeServices {
+        hold: Some(hold.clone()),
+    };
+
+    let limits = Limits::default();
+    let in_memory = InMemoryRateLimiter::new();
+    let auth = AuthLayer::new(cln, limits.max_request_body_bytes);
+    let admission = AdmissionLayer::new(None, in_memory.clone(), &limits);
+    let rate_limit = RateLimitLayer::new(None, in_memory);
+
+    let (listener, addr) = bind().await;
+    let server = Server::builder()
+        .tls_config(server_tls(&pki))
+        .unwrap()
+        .max_concurrent_streams(1)
+        .layer(ClientIdentityLayer::new())
+        .layer(admission)
+        .layer(auth)
+        .layer(rate_limit)
+        .add_service(NodeServicesServer::new(service));
+    let server_handle = tokio::spawn(async move {
+        let _ = server
+            .serve_with_incoming(TcpIncoming::from(listener))
+            .await;
+    });
+
+    let client = connect_client(&pki, 0, addr).await;
+
+    let mut streams = Vec::new();
+    for _ in 0..8 {
+        let mut client = client.clone();
+        streams.push(tokio::spawn(async move {
+            client.watch_channels(watch_channels_request()).await
+        }));
+    }
+
+    // Wait until one handler is active, then let the queued requests settle.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while hold.active() == 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        hold.active() >= 1,
+        "at least one stream must reach the service"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        hold.max_active() <= 1,
+        "max_concurrent_streams=1 must bound active handlers, got {}",
+        hold.max_active()
+    );
+
+    // Cancel every client stream and drop the connection. All handlers must
+    // be released (RAII/`tx.closed`) with no leaked active count.
+    for stream in streams {
+        stream.abort();
+    }
+    drop(client);
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while hold.active() != 0 && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(hold.active(), 0, "every handler must be released");
+    assert!(hold.max_active() <= 1);
+
+    server_handle.abort();
+    mock_handle.abort();
 }

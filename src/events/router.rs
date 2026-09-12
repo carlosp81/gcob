@@ -1,5 +1,5 @@
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, RwLock};
@@ -62,6 +62,10 @@ pub struct EventRouter {
     max_subscribers_global: usize,
     max_subscribers_per_type: usize,
     slow_subscriber_max_drops: u64,
+    /// O(1) global subscriber count, updated only while holding the write
+    /// lock. [`Self::total_subscribers`] recomputes it and is used to detect
+    /// drift in tests.
+    tracked_subscribers: AtomicUsize,
     stats: Arc<EventRouterStats>,
 }
 
@@ -86,6 +90,7 @@ impl EventRouter {
             max_subscribers_global: limits.max_subscribers_global.max(1),
             max_subscribers_per_type: limits.max_subscribers_per_type.max(1),
             slow_subscriber_max_drops: limits.slow_subscriber_max_drops.max(1),
+            tracked_subscribers: AtomicUsize::new(0),
             stats: Arc::new(EventRouterStats::default()),
         }
     }
@@ -103,8 +108,7 @@ impl EventRouter {
         if type_count >= self.max_subscribers_per_type {
             return Err(SubscribeError::TypeLimit);
         }
-        let total: usize = subs.values().map(|list| list.len()).sum();
-        if total >= self.max_subscribers_global {
+        if self.tracked_subscribers.load(Ordering::Relaxed) >= self.max_subscribers_global {
             return Err(SubscribeError::GlobalLimit);
         }
 
@@ -115,13 +119,20 @@ impl EventRouter {
                 sender,
                 drops: Arc::new(AtomicU64::new(0)),
             });
+        self.tracked_subscribers.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     pub async fn unsubscribe(&self, event_type: &str, id: &str) {
         let mut subs = self.subscribers.write().await;
         if let Some(list) = subs.get_mut(event_type) {
+            let before = list.len();
             list.retain(|s| s.id != id);
+            let removed = before - list.len();
+            if removed > 0 {
+                self.tracked_subscribers
+                    .fetch_sub(removed, Ordering::Relaxed);
+            }
             if list.is_empty() {
                 subs.remove(event_type);
             }
@@ -152,7 +163,7 @@ impl EventRouter {
         }
 
         self.stats.events_dispatched.fetch_add(1, Ordering::Relaxed);
-        let mut to_remove: Vec<SubscriberId> = Vec::new();
+        let mut to_remove: HashSet<SubscriberId> = HashSet::new();
 
         for (id, sender, drops) in snapshot {
             match sender.try_send(event.clone()) {
@@ -164,30 +175,35 @@ impl EventRouter {
                     self.stats.events_dropped.fetch_add(1, Ordering::Relaxed);
                     let consecutive = drops.fetch_add(1, Ordering::Relaxed) + 1;
                     if consecutive >= self.slow_subscriber_max_drops {
-                        to_remove.push(id);
+                        to_remove.insert(id);
                     }
                 }
                 Err(mpsc::error::TrySendError::Closed(_)) => {
                     self.stats.events_dropped.fetch_add(1, Ordering::Relaxed);
-                    to_remove.push(id);
+                    to_remove.insert(id);
                 }
             }
         }
 
         if !to_remove.is_empty() {
-            let removed = to_remove.len() as u64;
             let mut subs = self.subscribers.write().await;
+            let mut removed = 0usize;
             if let Some(list) = subs.get_mut(event_type) {
+                let before = list.len();
                 list.retain(|s| !to_remove.contains(&s.id));
+                removed = before - list.len();
                 if list.is_empty() {
                     subs.remove(event_type);
                 }
             }
-            drop(subs);
-            self.stats
-                .subscribers_dropped
-                .fetch_add(removed, Ordering::Relaxed);
-            tracing::warn!(event_type, removed, "Unsubscribed dead or slow subscribers");
+            if removed > 0 {
+                self.tracked_subscribers
+                    .fetch_sub(removed, Ordering::Relaxed);
+                self.stats
+                    .subscribers_dropped
+                    .fetch_add(removed as u64, Ordering::Relaxed);
+                tracing::warn!(event_type, removed, "Unsubscribed dead or slow subscribers");
+            }
         }
     }
 
@@ -207,6 +223,14 @@ impl EventRouter {
     pub async fn total_subscribers(&self) -> usize {
         let subs = self.subscribers.read().await;
         subs.values().map(|l| l.len()).sum()
+    }
+
+    /// O(1) subscriber count maintained under the write lock.
+    ///
+    /// [`Self::total_subscribers`] recomputes the count from the map so tests
+    /// can detect drift in this counter.
+    pub fn tracked_subscribers(&self) -> usize {
+        self.tracked_subscribers.load(Ordering::Relaxed)
     }
 }
 
@@ -577,5 +601,145 @@ mod tests {
         router.unsubscribe("payment", "s1").await;
         router.subscribe("payment", "s2".into(), tx2).await.unwrap();
         assert_eq!(router.total_subscribers().await, 1);
+    }
+
+    // --- GCOB-014: linear eviction (Fase B) ---
+
+    #[tokio::test]
+    async fn dispatch_removes_dead_subscribers_without_quadratic_scan() {
+        let router = EventRouter::with_limits(RouterLimits {
+            max_subscribers_global: 1024,
+            max_subscribers_per_type: 1024,
+            slow_subscriber_max_drops: 64,
+        });
+
+        for i in 0..512 {
+            let (tx, rx) = mpsc::channel(4);
+            router
+                .subscribe("payment", format!("dead-{i}"), tx)
+                .await
+                .unwrap();
+            drop(rx);
+        }
+        assert_eq!(router.tracked_subscribers(), 512);
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            router.dispatch("payment", payment_event("evt-dead")),
+        )
+        .await
+        .expect("linear eviction must finish well within the timeout");
+
+        assert_eq!(router.subscriber_count("payment").await, 0);
+        assert_eq!(router.tracked_subscribers(), 0);
+        assert_eq!(
+            router.stats().subscribers_dropped.load(Ordering::Relaxed),
+            512
+        );
+    }
+
+    // --- Global subscriber counter consistency (Fase B) ---
+
+    #[tokio::test]
+    async fn subscriber_counter_matches_recomputed_count() {
+        let router = EventRouter::with_limits(RouterLimits {
+            max_subscribers_global: 8,
+            max_subscribers_per_type: 4,
+            slow_subscriber_max_drops: 1,
+        });
+
+        for i in 0..6 {
+            let (tx, rx) = mpsc::channel(2);
+            let event_type = if i % 2 == 0 { "payment" } else { "invoice" };
+            router
+                .subscribe(event_type, format!("s-{i}"), tx)
+                .await
+                .unwrap();
+            if i == 0 {
+                drop(rx);
+            }
+        }
+        assert_eq!(router.tracked_subscribers(), 6);
+
+        // Explicit unsubscribe plus eviction of the dead subscriber.
+        router.unsubscribe("invoice", "s-1").await;
+        router.dispatch("payment", payment_event("evt-x")).await;
+
+        assert_eq!(
+            router.tracked_subscribers(),
+            router.total_subscribers().await,
+            "maintained counter must match the map"
+        );
+
+        // Mixed churn: some subscribes hit the caps and must not increment.
+        for i in 6..16 {
+            let (tx, _rx) = mpsc::channel(2);
+            let _ = router.subscribe("payment", format!("s-{i}"), tx).await;
+        }
+        assert_eq!(
+            router.tracked_subscribers(),
+            router.total_subscribers().await
+        );
+
+        // Full drain returns every counter to zero.
+        for i in 0..16 {
+            router.unsubscribe("payment", &format!("s-{i}")).await;
+            router.unsubscribe("invoice", &format!("s-{i}")).await;
+        }
+        assert_eq!(router.tracked_subscribers(), 0);
+        assert_eq!(router.total_subscribers().await, 0);
+    }
+
+    // --- Fan-out benchmark (GCOB-015, Fase B) ---
+
+    /// Prints dispatch throughput per subscriber. Run with
+    /// `cargo test --lib fanout_dispatch_bench -- --include-ignored`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "benchmark: run with --include-ignored"]
+    async fn fanout_dispatch_bench() {
+        const SUBSCRIBERS: usize = 512;
+        const ITERATIONS: usize = 200;
+
+        let router = EventRouter::with_limits(RouterLimits {
+            max_subscribers_global: SUBSCRIBERS,
+            max_subscribers_per_type: SUBSCRIBERS,
+            slow_subscriber_max_drops: u64::MAX,
+        });
+
+        let mut receivers = Vec::with_capacity(SUBSCRIBERS);
+        for i in 0..SUBSCRIBERS {
+            let (tx, rx) = mpsc::channel(ITERATIONS + 1);
+            router
+                .subscribe("payment", format!("bench-{i}"), tx)
+                .await
+                .unwrap();
+            receivers.push(rx);
+        }
+
+        let started = std::time::Instant::now();
+        for i in 0..ITERATIONS {
+            router
+                .dispatch("payment", payment_event(&format!("bench-evt-{i}")))
+                .await;
+        }
+        let elapsed = started.elapsed();
+
+        let total_deliveries = (SUBSCRIBERS * ITERATIONS) as f64;
+        let per_delivery_ns = elapsed.as_nanos() as f64 / total_deliveries;
+        println!(
+            "fan-out bench: {SUBSCRIBERS} subscribers x {ITERATIONS} events in {elapsed:?} \
+             ({per_delivery_ns:.0} ns/delivery)"
+        );
+
+        assert_eq!(
+            router.stats().events_dropped.load(Ordering::Relaxed),
+            0,
+            "benchmark channels must have enough capacity"
+        );
+        assert_eq!(
+            router.tracked_subscribers(),
+            router.total_subscribers().await
+        );
+        drop(receivers);
     }
 }

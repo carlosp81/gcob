@@ -160,10 +160,10 @@ impl InMemoryRateLimiter {
         });
     }
 
-    /// Number of tracked keys; used by availability tests to assert that
-    /// spoofed claims cannot grow the limiter state.
-    #[cfg(test)]
-    pub(crate) async fn bucket_count(&self) -> usize {
+    /// Number of tracked keys; used by availability tests and the periodic
+    /// availability snapshot to assert that spoofed claims cannot grow the
+    /// limiter state.
+    pub async fn tracked_keys(&self) -> usize {
         self.buckets.lock().await.len()
     }
 }
