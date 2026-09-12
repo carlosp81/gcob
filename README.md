@@ -216,6 +216,26 @@ x-rune: EqX...A0
 Authorization: Bearer <jwt_token>
 ```
 
+Hardening applied by the server:
+
+- At most one `x-rune` header, length <= 4096 and base64url/restriction
+  charset only; malformed headers are rejected before any `check_rune` call.
+- The rune value is never written to logs or status messages, and is held in a
+  zeroizing buffer while accepted.
+- `check_rune` is called per request (no cache), so `blacklistrune` revokes
+  immediately; the pre-auth budget caps attempts per certificate.
+
+Issue scoped runes per client instead of sharing one:
+
+```bash
+lightning-cli commando-rune \
+  restrictions='["method=invoice", "method=xpay", "rate=10 per minute", "expiry=1760000000"]'
+```
+
+Store `GCOD_RUNE` (and the rest of the client config) in a trusted env file
+(`/etc/gcob/gcob.env` or `GCOB_ENV_FILE`) owned by root or the service user
+with mode `0600`/`0640`; the loader refuses symlinks and world-readable files.
+
 ### Security Filtering
 
 Event streaming automatically filters sensitive data:

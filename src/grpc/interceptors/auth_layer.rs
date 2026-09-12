@@ -7,11 +7,30 @@ use bytes::Bytes;
 use prost::Message;
 use tonic::Status;
 use tower::{Layer, Service};
+use zeroize::Zeroizing;
 
 use crate::cln::client::ClnClient;
 use crate::cln::cln_api;
 
 use super::auth::{validate_rune, RUNE_HEADER};
+
+/// Maximum accepted rune length. Real CLN runes are far shorter; anything
+/// larger is rejected before it can be copied into a backend request.
+pub(crate) const MAX_RUNE_LEN: usize = 4096;
+
+/// Characters allowed in a rune header value: the base64url alphabet plus the
+/// separators used by CLN rune restrictions (`/`, `=`, `&`, `|`, `,`, `.`,
+/// `:`, `+`). Anything else can never be a valid rune.
+fn is_valid_rune_charset(rune: &str) -> bool {
+    !rune.is_empty()
+        && rune.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || matches!(
+                    b,
+                    b'-' | b'_' | b'=' | b'/' | b'+' | b'&' | b'|' | b',' | b'.' | b':'
+                )
+        })
+}
 
 // --- Path → CLN method name mapping ---
 
@@ -171,16 +190,36 @@ where
     fn call(&mut self, req: http::Request<tonic::body::Body>) -> Self::Future {
         let path = req.uri().path().to_string();
 
-        // Extract rune from gRPC metadata headers
-        let rune = req
-            .headers()
-            .get(RUNE_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .map(|s| s.to_string())
-            .filter(|s| !s.is_empty());
+        // Extract the rune from gRPC metadata headers. A duplicate header is
+        // ambiguous (proxies and clients may disagree on which value counts),
+        // and malformed values can never be valid: both are rejected here,
+        // before any backend interaction. The accepted value is held in a
+        // `Zeroizing` buffer so it is wiped when the request completes.
+        let mut values = req.headers().get_all(RUNE_HEADER).iter();
+        let first = values.next();
+        if values.next().is_some() {
+            return Box::pin(async move {
+                Ok(unauthenticated_response(
+                    "Multiple Rune headers are not allowed",
+                ))
+            });
+        }
 
-        let rune = match rune {
-            Some(r) => r,
+        let rune = match first {
+            Some(value) => match value.to_str() {
+                Ok(value)
+                    if !value.is_empty()
+                        && value.len() <= MAX_RUNE_LEN
+                        && is_valid_rune_charset(value) =>
+                {
+                    Zeroizing::new(value.to_string())
+                }
+                _ => {
+                    return Box::pin(
+                        async move { Ok(unauthenticated_response("Invalid Rune header")) },
+                    );
+                }
+            },
             None => {
                 let msg = format!(
                     "Missing or empty Rune header '{}'. Provide a valid Rune for authentication.",
@@ -601,5 +640,193 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.headers().get("grpc-status").unwrap(), "16");
+    }
+
+    // --- Rune header hygiene (Fase 3) ---
+
+    fn grpc_message(response: &http::Response<tonic::body::Body>) -> String {
+        let raw = response
+            .headers()
+            .get("grpc-message")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default();
+        // tonic percent-encodes grpc-message; decode so assertions read the
+        // original text.
+        let bytes = raw.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                if let Ok(byte) = u8::from_str_radix(&raw[i + 1..i + 3], 16) {
+                    out.push(byte);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(bytes[i]);
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    #[test]
+    fn rune_charset_accepts_base64url_and_restrictions() {
+        assert!(is_valid_rune_charset(
+            "Q0FXzkB9DzGSJwBEjW9RwTGSfdh_i3e2Xz9O4cM1JDU="
+        ));
+        assert!(is_valid_rune_charset("abcDEF0123-_"));
+        assert!(is_valid_rune_charset(
+            "id/method=getinfo&rate=10,listfunds/expiry=1760000000/hmac"
+        ));
+    }
+
+    #[test]
+    fn rune_charset_rejects_spaces_and_controls() {
+        assert!(!is_valid_rune_charset("has space"));
+        assert!(!is_valid_rune_charset("semi;colon"));
+        assert!(!is_valid_rune_charset("quote\"char"));
+        assert!(!is_valid_rune_charset("new\nline"));
+        assert!(!is_valid_rune_charset(""));
+    }
+
+    #[tokio::test]
+    async fn duplicate_rune_header_is_rejected_without_backend_call() {
+        let (inner, calls) = counting_inner();
+        let mut service = AuthLayer::new(lazy_client(), 262_144).layer(inner);
+
+        let mut req = http::Request::new(tonic::body::Body::new(http_body_util::Full::new(
+            Bytes::new(),
+        )));
+        req.headers_mut()
+            .append(RUNE_HEADER, "rune-one".parse().unwrap());
+        req.headers_mut()
+            .append(RUNE_HEADER, "rune-two".parse().unwrap());
+        *req.uri_mut() = "/cln.NodeServices/Getinfo".parse().unwrap();
+
+        let response = service.call(req).await.unwrap();
+        assert_eq!(response.headers().get("grpc-status").unwrap(), "16");
+        assert!(grpc_message(&response).contains("Multiple Rune"));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "duplicate headers must not reach the backend"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_rune_header_is_rejected_before_backend_call() {
+        let (inner, calls) = counting_inner();
+        let mut service = AuthLayer::new(lazy_client(), 262_144).layer(inner);
+
+        let oversized = "a".repeat(MAX_RUNE_LEN + 1);
+        let mut req = http::Request::new(tonic::body::Body::new(http_body_util::Full::new(
+            Bytes::new(),
+        )));
+        req.headers_mut()
+            .insert(RUNE_HEADER, oversized.parse().unwrap());
+        *req.uri_mut() = "/cln.NodeServices/Getinfo".parse().unwrap();
+
+        let response = service.call(req).await.unwrap();
+        assert_eq!(response.headers().get("grpc-status").unwrap(), "16");
+        assert!(grpc_message(&response).contains("Invalid Rune"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn invalid_charset_rune_is_rejected_before_backend_call() {
+        let (inner, calls) = counting_inner();
+        let mut service = AuthLayer::new(lazy_client(), 262_144).layer(inner);
+
+        let mut req = http::Request::new(tonic::body::Body::new(http_body_util::Full::new(
+            Bytes::new(),
+        )));
+        req.headers_mut()
+            .insert(RUNE_HEADER, "bad;rune".parse().unwrap());
+        *req.uri_mut() = "/cln.NodeServices/Getinfo".parse().unwrap();
+
+        let response = service.call(req).await.unwrap();
+        assert_eq!(response.headers().get("grpc-status").unwrap(), "16");
+        assert!(grpc_message(&response).contains("Invalid Rune"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn well_formed_rune_reaches_rune_check() {
+        let (inner, _calls) = counting_inner();
+        let mut service = AuthLayer::new(lazy_client(), 262_144).layer(inner);
+
+        let mut req = http::Request::new(tonic::body::Body::new(http_body_util::Full::new(
+            Bytes::new(),
+        )));
+        req.headers_mut().insert(
+            RUNE_HEADER,
+            "Q0FXzkB9DzGSJwBEjW9RwTGSfdh_i3e2Xz9O4cM1JDU="
+                .parse()
+                .unwrap(),
+        );
+        *req.uri_mut() = "/cln.NodeServices/Getinfo".parse().unwrap();
+
+        let response = service.call(req).await.unwrap();
+        // The header passed the hygiene gate; the unreachable CLN fails the
+        // actual check (a different message than "Invalid Rune header").
+        assert_eq!(response.headers().get("grpc-status").unwrap(), "16");
+        assert!(grpc_message(&response).contains("Rune validation failed"));
+    }
+
+    // --- Regression: the rune value never reaches logs (Fase 1) ---
+
+    #[derive(Clone, Default)]
+    struct CaptureWriter(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+        type Writer = CaptureWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn rune_value_is_never_written_to_logs() {
+        const SECRET_RUNE: &str = "SuperSecretRune_0123456789-_=";
+
+        let capture = CaptureWriter::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(capture.clone())
+            .with_ansi(false)
+            .without_time()
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let (inner, _calls) = counting_inner();
+        let mut service = AuthLayer::new(lazy_client(), 262_144).layer(inner);
+
+        let mut req = http::Request::new(tonic::body::Body::new(http_body_util::Full::new(
+            Bytes::new(),
+        )));
+        req.headers_mut()
+            .insert(RUNE_HEADER, SECRET_RUNE.parse().unwrap());
+        *req.uri_mut() = "/cln.NodeServices/Getinfo".parse().unwrap();
+
+        let response = service.call(req).await.unwrap();
+        assert_eq!(response.headers().get("grpc-status").unwrap(), "16");
+
+        let logs = String::from_utf8(capture.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            !logs.contains(SECRET_RUNE),
+            "rune value leaked into logs: {logs}"
+        );
+        assert!(logs.contains("check_rune call failed"), "logs: {logs}");
     }
 }

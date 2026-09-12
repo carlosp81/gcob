@@ -84,10 +84,13 @@ fn load_env_file(path: &Path) -> io::Result<()> {
             )));
         }
 
+        // Secrets (such as the CLN rune) live in this file: only 0600 or
+        // 0640 are accepted. 0640 allows an explicit group (e.g. gcob) to
+        // read it while still refusing world-readable 0644.
         let mode = metadata.mode() & 0o777;
-        if mode & 0o022 != 0 {
+        if !matches!(mode, 0o600 | 0o640) {
             return Err(io::Error::other(format!(
-                "permissions {:04o} are writable by group/other (expected 0600 or 0640)",
+                "permissions {:04o} are not accepted (expected 0600 or 0640)",
                 mode
             )));
         }
@@ -128,11 +131,47 @@ mod tests {
         std::env::remove_var("GCOB_TEST_LOADED");
     }
 
+    #[test]
+    fn accepts_group_readable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), "env", 0o640, "GCOB_TEST_GROUP_READABLE=yes\n");
+        load_env_file(&path).unwrap();
+        assert_eq!(std::env::var("GCOB_TEST_GROUP_READABLE").unwrap(), "yes");
+        std::env::remove_var("GCOB_TEST_GROUP_READABLE");
+    }
+
     #[cfg(unix)]
     #[test]
     fn rejects_group_or_other_writable() {
         let dir = tempfile::tempdir().unwrap();
         let path = write_file(dir.path(), "env", 0o666, "GCOB_TEST_INSECURE=1\n");
+        assert!(load_env_file(&path).is_err());
+        assert!(std::env::var("GCOB_TEST_INSECURE").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_world_readable_rune_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), "env", 0o644, "GCOB_TEST_INSECURE=1\n");
+        assert!(load_env_file(&path).is_err());
+        assert!(std::env::var("GCOB_TEST_INSECURE").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_owner_read_only_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), "env", 0o400, "GCOB_TEST_INSECURE=1\n");
+        assert!(load_env_file(&path).is_err());
+        assert!(std::env::var("GCOB_TEST_INSECURE").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_group_writable_owner_only_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_file(dir.path(), "env", 0o620, "GCOB_TEST_INSECURE=1\n");
         assert!(load_env_file(&path).is_err());
         assert!(std::env::var("GCOB_TEST_INSECURE").is_err());
     }

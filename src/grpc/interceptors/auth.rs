@@ -29,18 +29,33 @@ pub(crate) fn extract_client_id<T>(request: &Request<T>) -> Option<String> {
         .map(String::from)
 }
 
+/// Build the CLN `check_rune` request for a rune/method/params tuple.
+///
+/// Kept separate from [`validate_rune`] so tests can assert the exact payload
+/// sent to CLN. The rune must be copied because the generated prost type owns
+/// a `String`: the caller's `Zeroizing` buffer is wiped on drop, but the copy
+/// inside the request cannot be zeroized before tonic releases it.
+pub(crate) fn build_checkrune_request(
+    node_id: &str,
+    rune: &str,
+    method: &str,
+    params: Vec<String>,
+) -> cln_api::CheckruneRequest {
+    cln_api::CheckruneRequest {
+        rune: rune.to_string(),
+        nodeid: Some(node_id.to_string()),
+        method: Some(method.to_string()),
+        params,
+    }
+}
+
 pub(crate) async fn validate_rune(
     client: &ClnClient,
     rune: &str,
     method: &str,
     params: Vec<String>,
 ) -> Result<(), Status> {
-    let check_request = cln_api::CheckruneRequest {
-        rune: rune.to_string(),
-        nodeid: Some(client.node_id.clone()),
-        method: Some(method.to_string()),
-        params,
-    };
+    let check_request = build_checkrune_request(&client.node_id, rune, method, params);
 
     let mut cln_client = client.inner.clone();
     let response = cln_client
@@ -328,5 +343,32 @@ mod tests {
             result.is_err(),
             "Uppercase header names are rejected by HTTP/2 layer"
         );
+    }
+
+    // --- check_rune payload construction (Fase 4) ---
+
+    #[test]
+    fn checkrune_request_carries_nodeid_method_params_and_rune() {
+        let request = build_checkrune_request(
+            "02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "test-rune-id/hmac",
+            "invoice",
+            vec!["50000".into(), "label-1".into(), "desc".into()],
+        );
+
+        assert_eq!(request.rune, "test-rune-id/hmac");
+        assert_eq!(
+            request.nodeid.as_deref(),
+            Some("02aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(request.method.as_deref(), Some("invoice"));
+        assert_eq!(request.params, vec!["50000", "label-1", "desc"]);
+    }
+
+    #[test]
+    fn checkrune_request_for_stream_method_has_no_params() {
+        let request = build_checkrune_request("node-a", "rune-a", "watch_channels", vec![]);
+        assert_eq!(request.method.as_deref(), Some("watch_channels"));
+        assert!(request.params.is_empty());
     }
 }

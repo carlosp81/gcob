@@ -154,9 +154,59 @@ The fix: Always create runes with restrictions using `lightning-cli createrune -
 
 | # | Task | Status | Notes |
 |---|------|--------|-------|
-| 7 | **Integration tests with mock CLN** | NOT DONE | Current tests only cover header extraction. Need tests that verify full auth flow including CLN `check_rune` call. |
-| 8 | **AuthLayer test for rejection responses** | NOT DONE | Test that requests without rune return proper gRPC UNAUTHENTICATED status. |
-| 9 | **Document rune creation best practices** | NOT DONE | Document how to create runes with proper restrictions (method, rate limit, expiry). |
+| 7 | **Integration tests with mock CLN** | **DONE** | `e2e_tests::check_rune_receives_method_params_and_node_id` y `invalid_rune_is_rejected_after_check_rune` levantan un backend CLN simulado (tower service con `NamedService "cln.Node"`) que captura el `CheckruneRequest` y verifica method/params/nodeid. |
+| 8 | **AuthLayer test for rejection responses** | **DONE** | Tests de status 16 para rune ausente, duplicada, sobredimensionada y charset inválido. |
+| 9 | **Document rune creation best practices** | **DONE** | Ver "Rune creation best practices" y "Server-side rune hardening" abajo. |
+
+---
+
+## Rune creation best practices
+
+Runes are bearer tokens: whoever holds one can use every method/limit it
+grants. Treat them like passwords and scope them per client.
+
+```bash
+# Read-only client: only getinfo.
+lightning-cli commando-rune \
+  restrictions='["method=getinfo", "rate=60 per minute"]'
+
+# Payment client: invoice + xpay, with expiry and rate limit.
+lightning-cli commando-rune \
+  restrictions='["method=invoice", "method=xpay", "rate=10 per minute", "expiry=1760000000"]'
+
+# Per-client runes: never reuse one rune across clients, so a leak only
+# affects a single integration and can be revoked with blacklistrune.
+lightning-cli blacklistrune start=<unique_id>
+```
+
+Rules of thumb:
+
+- Never create an unrestricted rune for a remote client.
+- Always pin `method=...` (the server passes the exact method name to
+  `check_rune`), and add `rate=` and `expiry=` where applicable.
+- Avoid `perms=...` (admin) runes for API clients.
+- Rotate periodically and on suspicion; revoke with `blacklistrune`.
+
+## Server-side rune hardening
+
+- The env file that stores `GCOD_RUNE` (and any other secret) is only loaded
+  from `GCOB_ENV_FILE` or `/etc/gcob/gcob.env`, and must be a regular file
+  owned by root or the service user with mode `0600` or `0640` (world-readable
+  `0644` is refused). The file is opened with `O_NOFOLLOW`.
+- `x-rune` hygiene before any CLN call: at most one header, length <= 4096 and
+  base64url/restriction charset only. Missing/duplicate/malformed runes are
+  rejected with `UNAUTHENTICATED` and never reach `check_rune`.
+- The rune value is never written to logs or gRPC status messages
+  (`rune_value_is_never_written_to_logs`). The accepted header is held in a
+  `Zeroizing` buffer; the copy inside the prost request cannot be zeroized
+  before tonic releases it.
+- The pre-authentication budget (`GCOB_PREAUTH_LIMIT`) caps `check_rune` calls
+  per certificate fingerprint, so invalid runes cannot amplify backend load.
+- Keep `check_rune` per-request (no cache): revocation via `blacklistrune` is
+  effective immediately.
+- Service hardening: `LimitCORE=0` (no core dumps holding runes), run
+  `gcob serve` as the `gcob` user with `NoNewPrivileges=yes` and a read-only
+  `EnvironmentFile` (`/etc/gcob/gcob.env`, `0640 root:gcob`).
 
 ---
 
