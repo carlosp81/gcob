@@ -993,6 +993,10 @@ pub fn renew_certificates(req: &RenewRequest) -> Result<RenewSummary, CertError>
 
 /// Handle `gcob certs renew [--force]`
 pub fn handle_renew(cert_dir: &Path, args: RenewArgs) {
+    if let Err(e) = gcob::role::require_server("certs renew") {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
     if let Err(e) = check_gcob_access() {
         eprintln!("Error: {}", e);
         std::process::exit(1);

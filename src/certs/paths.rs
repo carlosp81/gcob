@@ -13,22 +13,51 @@ pub struct AdminAccount {
     pub home: PathBuf,
 }
 
+/// Copy an account entry out of the caller-provided buffer.
+#[cfg(unix)]
+fn copy_passwd(entry: &libc::passwd) -> Option<AdminAccount> {
+    if entry.pw_name.is_null() || entry.pw_dir.is_null() {
+        return None;
+    }
+    Some(AdminAccount {
+        name: unsafe { CStr::from_ptr(entry.pw_name) }
+            .to_string_lossy()
+            .into_owned(),
+        uid: entry.pw_uid,
+        gid: entry.pw_gid,
+        home: PathBuf::from(
+            unsafe { CStr::from_ptr(entry.pw_dir) }
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    })
+}
+
+/// Buffer size for the reentrant passwd lookups. 16 KiB is well above the
+/// typical `sysconf(_SC_GETPW_R_SIZE_MAX)` value (1024 on glibc).
+#[cfg(unix)]
+const PASSWD_BUFFER_SIZE: usize = 16 * 1024;
+
 #[cfg(unix)]
 fn account_from_name(name: &str) -> Option<AdminAccount> {
     let cname = std::ffi::CString::new(name).ok()?;
-    unsafe {
-        let pwd = libc::getpwnam(cname.as_ptr());
-        if pwd.is_null() {
-            return None;
-        }
-        let entry = &*pwd;
-        Some(AdminAccount {
-            name: CStr::from_ptr(entry.pw_name).to_string_lossy().to_string(),
-            uid: entry.pw_uid,
-            gid: entry.pw_gid,
-            home: PathBuf::from(CStr::from_ptr(entry.pw_dir).to_string_lossy().to_string()),
-        })
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buffer = vec![0u8; PASSWD_BUFFER_SIZE];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+
+    let rc = unsafe {
+        libc::getpwnam_r(
+            cname.as_ptr(),
+            &mut entry,
+            buffer.as_mut_ptr() as *mut libc::c_char,
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 || result.is_null() {
+        return None;
     }
+    copy_passwd(&entry)
 }
 
 #[cfg(not(unix))]
@@ -38,19 +67,23 @@ fn account_from_name(_name: &str) -> Option<AdminAccount> {
 
 #[cfg(unix)]
 fn account_from_uid(uid: u32) -> Option<AdminAccount> {
-    unsafe {
-        let pwd = libc::getpwuid(uid);
-        if pwd.is_null() {
-            return None;
-        }
-        let entry = &*pwd;
-        Some(AdminAccount {
-            name: CStr::from_ptr(entry.pw_name).to_string_lossy().to_string(),
-            uid: entry.pw_uid,
-            gid: entry.pw_gid,
-            home: PathBuf::from(CStr::from_ptr(entry.pw_dir).to_string_lossy().to_string()),
-        })
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut buffer = vec![0u8; PASSWD_BUFFER_SIZE];
+    let mut result: *mut libc::passwd = std::ptr::null_mut();
+
+    let rc = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut entry,
+            buffer.as_mut_ptr() as *mut libc::c_char,
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if rc != 0 || result.is_null() {
+        return None;
     }
+    copy_passwd(&entry)
 }
 
 #[cfg(not(unix))]
@@ -218,7 +251,7 @@ pub fn check_gcob_access() -> Result<(), CertError> {
                2. Set a password (for sudo -u gcob):\n\
                   sudo passwd gcob\n\n\
              Then run:\n\
-                sudo -u gcob gcob init --client",
+                sudo -u gcob gcob init --cln-dir <CLN_DIR>",
         ))
     })?;
 
@@ -397,13 +430,92 @@ pub fn reject_symlink_components(path: &Path) -> Result<(), CertError> {
     Ok(())
 }
 
+/// POSIX ACL access tags (`system.posix_acl_access` entries) that can grant
+/// broad write access.
+#[cfg(unix)]
+const ACL_TAG_GROUP_OBJ: u16 = 0x04;
+#[cfg(unix)]
+const ACL_TAG_GROUP: u16 = 0x08;
+#[cfg(unix)]
+const ACL_TAG_OTHER: u16 = 0x20;
+
+/// Parse a `system.posix_acl_access` blob and report whether it grants write
+/// to a broad principal (base group, named group or other).
+///
+/// Named-user entries are accepted: they are explicit grants by the directory
+/// owner (for example the `gcob` service account). Returns `None` when the
+/// blob is not a valid v2 ACL.
+#[cfg(unix)]
+fn acl_has_broad_write_from_bytes(buf: &[u8]) -> Option<bool> {
+    if buf.len() < 4 || !(buf.len() - 4).is_multiple_of(8) {
+        return None;
+    }
+    let version = u32::from_le_bytes(buf[0..4].try_into().ok()?);
+    if version != 2 {
+        return None;
+    }
+
+    let mut broad = false;
+    for entry in buf[4..].chunks_exact(8) {
+        let tag = u16::from_le_bytes(entry[0..2].try_into().ok()?);
+        let perm = u16::from_le_bytes(entry[2..4].try_into().ok()?);
+        if perm & 0o2 != 0 && matches!(tag, ACL_TAG_GROUP_OBJ | ACL_TAG_GROUP | ACL_TAG_OTHER) {
+            broad = true;
+        }
+    }
+    Some(broad)
+}
+
+/// Read the access ACL of `path` and report whether it grants broad write.
+///
+/// Returns `None` when the filesystem has no access ACL or does not support
+/// xattrs, so callers can fall back to the plain mode-bit check.
+#[cfg(unix)]
+fn acl_has_broad_write(path: &Path) -> Option<bool> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let cpath = CString::new(path.as_os_str().as_bytes()).ok()?;
+    let name = b"system.posix_acl_access\0";
+
+    let size = unsafe {
+        libc::getxattr(
+            cpath.as_ptr(),
+            name.as_ptr().cast(),
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if size <= 0 {
+        return None;
+    }
+
+    let mut buf = vec![0u8; size as usize];
+    let read = unsafe {
+        libc::getxattr(
+            cpath.as_ptr(),
+            name.as_ptr().cast(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+        )
+    };
+    if read < 0 {
+        return None;
+    }
+    buf.truncate(read as usize);
+    acl_has_broad_write_from_bytes(&buf)
+}
+
 /// Create (if needed) and validate a directory for privileged certificate output.
 ///
 /// - rejects symlinks in any existing path component;
 /// - creates missing components with mode 0700;
 /// - rejects a final directory that is writable by group/other or owned by an
-///   account outside `allowed_owners`;
-/// - applies `mode` and ownership `owner` to the final directory.
+///   account outside `allowed_owners`. A directory whose write bits come from
+///   a POSIX ACL mask enabling named users (e.g. `gcob`) is accepted;
+/// - applies `mode` and ownership `owner` to the final directory. When an
+///   access ACL is present the mode is left untouched, because `chmod` resets
+///   the ACL mask and would revoke the named-user access.
 pub fn ensure_secure_dir(
     path: &Path,
     mode: u32,
@@ -468,11 +580,17 @@ pub fn ensure_secure_dir(
         use std::os::unix::fs::{chown, MetadataExt, PermissionsExt};
 
         let current_mode = metadata.mode() & 0o777;
-        if current_mode & 0o022 != 0 {
+        let acl_write = acl_has_broad_write(path);
+        // A group/other write bit may be the POSIX ACL mask enabling a named
+        // user (e.g. gcob), not real group access. Only the stat fallback and
+        // ACLs that grant broad write are rejected.
+        if current_mode & 0o022 != 0 && acl_write != Some(false) {
             return Err(CertError::Io(std::io::Error::other(format!(
-                "Directory {} has permissions {:04o} (group/other writable); refusing to use it",
+                "Directory {} has permissions {:04o} (group/other writable); refusing to use it \
+                 (run 'chmod 0700 {}' or grant access with a named-user ACL)",
                 path.display(),
-                current_mode
+                current_mode,
+                path.display()
             ))));
         }
         if !allowed_owners.is_empty() && !allowed_owners.contains(&metadata.uid()) {
@@ -483,7 +601,12 @@ pub fn ensure_secure_dir(
             ))));
         }
 
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+        // `chmod` resets the ACL mask, which would silently revoke named-user
+        // access (e.g. the gcob service user). Only normalize the mode when no
+        // access ACL is present.
+        if acl_write.is_none() {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+        }
         chown(path, Some(owner.0), Some(owner.1))?;
     }
     #[cfg(not(unix))]
@@ -687,6 +810,10 @@ impl ClnSourcePaths {
 mod tests {
     use super::*;
 
+    const TAG_USER_OBJ: u16 = 0x01;
+    const TAG_USER: u16 = 0x02;
+    const TAG_MASK: u16 = 0x10;
+
     #[test]
     fn account_lookup_resolves_root() {
         let root = account_from_name("root").expect("root account");
@@ -790,5 +917,156 @@ mod tests {
         assert!(lock_dir(dir.path()).is_err());
         drop(first);
         assert!(lock_dir(dir.path()).is_ok());
+    }
+
+    #[test]
+    fn account_lookups_are_thread_safe() {
+        let handles: Vec<_> = (0..8)
+            .map(|_| std::thread::spawn(|| account_from_name("root").map(|account| account.uid)))
+            .collect();
+        for handle in handles {
+            assert_eq!(handle.join().unwrap(), Some(0));
+        }
+    }
+
+    fn acl_blob(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(4 + entries.len() * 8);
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        for (tag, perm, id) in entries {
+            buf.extend_from_slice(&tag.to_le_bytes());
+            buf.extend_from_slice(&perm.to_le_bytes());
+            buf.extend_from_slice(&id.to_le_bytes());
+        }
+        buf
+    }
+
+    /// Attach an access ACL to `path`; returns false when the filesystem does
+    /// not support POSIX ACLs, so the test can be skipped.
+    fn set_access_acl(path: &Path, entries: &[(u16, u16, u32)]) -> bool {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let buf = acl_blob(entries);
+        let cpath = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let name = b"system.posix_acl_access\0";
+        let rc = unsafe {
+            libc::setxattr(
+                cpath.as_ptr(),
+                name.as_ptr().cast(),
+                buf.as_ptr().cast(),
+                buf.len(),
+                0,
+            )
+        };
+        rc == 0
+    }
+
+    #[test]
+    fn acl_parser_accepts_named_user_write_only() {
+        let account = current_account().unwrap();
+        let blob = acl_blob(&[
+            (TAG_USER_OBJ, 7, u32::MAX),
+            (TAG_USER, 7, account.uid), // named user (ACL_USER)
+            (ACL_TAG_GROUP_OBJ, 0, u32::MAX),
+            (TAG_MASK, 7, u32::MAX), // ACL mask enables the named user
+            (ACL_TAG_OTHER, 0, u32::MAX),
+        ]);
+        assert_eq!(acl_has_broad_write_from_bytes(&blob), Some(false));
+    }
+
+    #[test]
+    fn acl_parser_detects_broad_write() {
+        let group_write = acl_blob(&[
+            (TAG_USER_OBJ, 7, u32::MAX),
+            (ACL_TAG_GROUP_OBJ, 2, u32::MAX),
+            (ACL_TAG_OTHER, 0, u32::MAX),
+        ]);
+        assert_eq!(acl_has_broad_write_from_bytes(&group_write), Some(true));
+
+        let other_write = acl_blob(&[
+            (TAG_USER_OBJ, 7, u32::MAX),
+            (ACL_TAG_GROUP_OBJ, 0, u32::MAX),
+            (ACL_TAG_OTHER, 6, u32::MAX),
+        ]);
+        assert_eq!(acl_has_broad_write_from_bytes(&other_write), Some(true));
+
+        let named_group = acl_blob(&[
+            (TAG_USER_OBJ, 7, u32::MAX),
+            (ACL_TAG_GROUP_OBJ, 0, u32::MAX),
+            (ACL_TAG_GROUP, 2, 42),
+            (TAG_MASK, 7, u32::MAX),
+            (ACL_TAG_OTHER, 0, u32::MAX),
+        ]);
+        assert_eq!(acl_has_broad_write_from_bytes(&named_group), Some(true));
+    }
+
+    #[test]
+    fn acl_parser_rejects_invalid_blobs() {
+        assert_eq!(acl_has_broad_write_from_bytes(&[]), None);
+        assert_eq!(acl_has_broad_write_from_bytes(&[2, 0, 0, 0]), Some(false));
+        assert_eq!(acl_has_broad_write_from_bytes(&[1, 0, 0, 0]), None);
+        assert_eq!(acl_has_broad_write_from_bytes(&[2, 0, 0, 0, 1, 0]), None);
+    }
+
+    #[test]
+    fn ensure_secure_dir_accepts_acl_masked_dir_and_preserves_acl() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let target = base.path().join("certs");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let account = current_account().unwrap();
+        let acl = [
+            (TAG_USER_OBJ, 7, u32::MAX),
+            (TAG_USER, 7, account.uid), // named user
+            (ACL_TAG_GROUP_OBJ, 0, u32::MAX),
+            (TAG_MASK, 7, u32::MAX), // mask makes stat report 0770
+            (ACL_TAG_OTHER, 0, u32::MAX),
+        ];
+        if !set_access_acl(&target, &acl) {
+            return; // filesystem without POSIX ACL support
+        }
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o770
+        );
+
+        ensure_secure_dir(&target, 0o700, (account.uid, account.gid), &[account.uid]).unwrap();
+
+        // The ACL mask survived: chmod was skipped, so named-user access was
+        // not revoked.
+        assert_eq!(acl_has_broad_write(&target), Some(false));
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o770
+        );
+    }
+
+    #[test]
+    fn ensure_secure_dir_rejects_acl_with_broad_write() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let target = base.path().join("certs");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o770)).unwrap();
+
+        let account = current_account().unwrap();
+        let acl = [
+            (TAG_USER_OBJ, 7, u32::MAX),
+            (TAG_USER, 7, account.uid),
+            (ACL_TAG_GROUP_OBJ, 2, u32::MAX), // real group write
+            (TAG_MASK, 7, u32::MAX),
+            (ACL_TAG_OTHER, 0, u32::MAX),
+        ];
+        if !set_access_acl(&target, &acl) {
+            return;
+        }
+
+        assert!(
+            ensure_secure_dir(&target, 0o700, (account.uid, account.gid), &[account.uid]).is_err()
+        );
     }
 }

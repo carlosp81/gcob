@@ -11,12 +11,6 @@ use cli::{Cli, Commands};
 async fn main() {
     gcob::config::load_trusted_env();
 
-    // Mode-specific help: `gcob init --client|--server --help` only shows the
-    // arguments relevant to that mode. `gcob init --help` keeps the full help.
-    if cli::maybe_print_init_help() {
-        return;
-    }
-
     // Initialize tracing
     tracing_subscriber::fmt()
         .with_target(true)
@@ -27,14 +21,7 @@ async fn main() {
 
     match cli.command {
         Commands::Init {
-            client,
-            server,
-            force,
-            client_hostname,
-            client_ip,
-            server_hostname,
-            server_ip,
-            no_confirm,
+            common,
             cln_dir,
             haproxy_user,
             api_user,
@@ -44,41 +31,30 @@ async fn main() {
             allow_loopback,
             dry_run,
         } => {
-            if client {
-                if let Err(e) = cli::server::handle_init_client(
-                    force,
-                    no_confirm,
-                    client_hostname.as_deref(),
-                    client_ip.as_deref(),
-                ) {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }
-            } else if server {
-                let args = cli::server::InitServerArgs {
-                    force,
-                    no_confirm,
-                    hostname: server_hostname,
-                    ip: server_ip,
-                    cln_dir,
-                    haproxy_user,
-                    api_user,
-                    haproxy_cert_dir,
-                    api_certs_dir,
-                    rotate_ca,
-                    allow_loopback,
-                    dry_run,
-                };
-                if let Err(e) = cli::server::handle_init_server(args) {
-                    eprintln!("Error: {}", e);
-                    std::process::exit(1);
-                }
-            } else {
-                eprintln!("Run 'gcob init --help' to see available options");
+            let args = cli::server::InitServerArgs {
+                force: common.force,
+                no_confirm: common.no_confirm,
+                hostname: common.hostname,
+                ip: common.ip,
+                cln_dir,
+                haproxy_user,
+                api_user,
+                haproxy_cert_dir,
+                api_certs_dir,
+                rotate_ca,
+                allow_loopback,
+                dry_run,
+            };
+            if let Err(e) = cli::server::handle_init_server(args) {
+                eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
         }
         Commands::Serve => {
+            if let Err(e) = gcob::role::require_server("serve") {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
             tracing::info!("Starting gcob");
             if let Err(e) = cli::server::handle_serve().await {
                 tracing::error!("Server failed: {}", e);
@@ -94,6 +70,10 @@ async fn main() {
             dry_run,
             expected_ca_fingerprint,
         } => {
+            if let Err(e) = gcob::role::require_server("sign") {
+                eprintln!("Error: {}", e);
+                std::process::exit(1);
+            }
             let args = cli::certs::SignArgs {
                 csr,
                 hostname,

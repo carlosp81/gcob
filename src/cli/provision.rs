@@ -1,4 +1,4 @@
-//! Atomic, fail-closed provisioning for `gcob init --server`.
+//! Atomic, fail-closed provisioning for `gcob init`.
 //!
 //! Security invariants:
 //! 1. Nothing is published until CA, identity, pinning, destinations, staging
@@ -269,7 +269,7 @@ pub fn provision_server(
     }
 
     let mut summary_text = format!(
-        "=== gcob init --server ===\n  Hostname:       {}\n  IP:             {}\n  CA fingerprint: {}\n",
+        "=== gcob init ===\n  Hostname:       {}\n  IP:             {}\n  CA fingerprint: {}\n",
         req.hostname, req.ip, validated.fingerprint_sha256
     );
     for file in &plan {

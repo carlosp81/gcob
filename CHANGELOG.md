@@ -1,5 +1,51 @@
 # Changelog
 
+## [0.5.1] - 2026-09-11
+
+Server-only `gcob init`, shared init flags and an ACL-safe certificate
+directory check.
+
+### Added
+- Shared `gcob::init_common::CommonInitArgs`: `--force`, `--no-confirm`,
+  `--hostname` and `--ip` defined once for `gcob init` and `gcob-client init`
+- `gcob::client_init::run_cli`: single client-init UI (summary, confirmation
+  and next steps); the `gcob-client` binary delegates to it
+
+### Changed
+- `gcob init` is server-only and requires `--cln-dir`; it no longer accepts
+  `--client`/`--server` mode flags
+- `gcob-client init` is the only client CSR entry point; its flags are renamed
+  to the shared `--hostname`/`--ip`
+- `gcob init --client` removed (deprecated in 0.5.0)
+- Mode-specific `init` help is now rendered natively by clap
+
+### Fixed
+- `ensure_secure_dir` no longer rejects certificate directories hardened with a
+  POSIX ACL (e.g. named-user access for `gcob`): the ACL mask was read as group
+  write, and normalizing the mode would have reset it; the ACL is now detected
+  and preserved
+
+## [0.5.0] - 2026-09-11
+
+Client/server role separation.
+
+### Added
+- `gcob-client init`: local CSR generation (`--client-hostname`, `--client-ip`,
+  `--output`, `--force`, `--no-confirm`) without certificates or a server
+  connection
+- `GCOB_ROLE=client|server|auto` for the `gcob` administration CLI; `auto` uses
+  `GRPC_BIND_ADDR` plus a secure `/etc/haproxy/certs`
+- Server-only commands (`serve`, `sign`, `certs renew`) are denied in client
+  role with an actionable message
+- `gcob-client init --help` shows only the local CSR options
+
+### Changed
+- `gcob` is server-only: client flags are hidden from `init --help`
+- `gcob init --client` is deprecated (still functional) in favor of
+  `gcob-client init`
+- `gcob-client` help now identifies itself as `gcob-client`
+- Client CSR generation moved to the shared library (`gcob::client_init`)
+
 ## [0.4.3] - 2026-09-11
 
 Security hardening across the CLI, `init --server`, `sign` and `certs renew`.

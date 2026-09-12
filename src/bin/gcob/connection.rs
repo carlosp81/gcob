@@ -4,17 +4,21 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
-use crate::cli::Cli;
-
-pub async fn connect(cli: &Cli) -> Result<Channel> {
+pub async fn connect(
+    host: &str,
+    port: u16,
+    ca: Option<&str>,
+    cert: Option<&str>,
+    key: Option<&str>,
+) -> Result<Channel> {
     // Resolve certificate paths
     let cert_dir = std::env::var("CLN_CERT_DIR")
         .ok()
         .map(std::path::PathBuf::from);
 
-    let ca_path = resolve_path(&cli.ca, &cert_dir, "ca.pem")?;
-    let cert_path = resolve_path(&cli.cert, &cert_dir, "client.pem")?;
-    let key_path = resolve_path(&cli.key, &cert_dir, "client-key.pem")?;
+    let ca_path = resolve_path(ca, &cert_dir, "ca.pem")?;
+    let cert_path = resolve_path(cert, &cert_dir, "client.pem")?;
+    let key_path = resolve_path(key, &cert_dir, "client-key.pem")?;
 
     // Read certificates
     let ca_pem = fs::read(&ca_path)
@@ -32,9 +36,9 @@ pub async fn connect(cli: &Cli) -> Result<Channel> {
     let tls = ClientTlsConfig::new()
         .ca_certificate(ca)
         .identity(identity)
-        .domain_name(tls_domain_name(&cli.host));
+        .domain_name(tls_domain_name(host));
 
-    let uri = format!("https://{}:{}", cli.host, cli.port);
+    let uri = format!("https://{}:{}", host, port);
     let channel = Endpoint::from_shared(uri.clone())
         .with_context(|| format!("Invalid endpoint: {}", uri))?
         .tls_config(tls)
@@ -54,7 +58,7 @@ pub async fn connect(cli: &Cli) -> Result<Channel> {
 }
 
 fn resolve_path(
-    arg: &Option<String>,
+    arg: Option<&str>,
     cert_dir: &Option<std::path::PathBuf>,
     default_name: &str,
 ) -> Result<std::path::PathBuf> {
