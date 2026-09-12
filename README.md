@@ -193,6 +193,17 @@ message PaymentEvent {
 - **Server certificates**: With SANs (DNS:debian-knots, IP:YOUR_SERVER_IP) — `debian-knots` is the server hostname
 - **Certificate validation**: Mutual TLS on all connections
 
+### Rate Limiting and Admission
+
+- Per-method budgets are keyed by the SHA-256 fingerprint of the client
+  certificate, never by client-supplied headers. The `x-client-id` header is
+  recorded as audit metadata only and cannot mint additional budgets.
+- A cheap pre-authentication budget is enforced per fingerprint before any
+  `check_rune` call against CLN, so invalid runes cannot amplify backend load.
+- Request bodies are bounded (`GCOB_MAX_REQUEST_BODY_BYTES`) and rejected
+  while streaming, before the full body is materialized or sent to CLN.
+- HTTP/2 concurrency and keepalive limits are applied per connection.
+
 ### Rune Authentication
 
 Every request must include a valid CLN rune:
@@ -273,6 +284,19 @@ SERVER_KEY_FILE=server-key.pem
 
 # Redis (optional)
 REDIS_URL=redis://127.0.0.1:6379
+
+# Availability limits (optional; defaults shown; zero/invalid values fail startup)
+GCOB_MAX_REQUEST_BODY_BYTES=262144
+GCOB_PREAUTH_LIMIT=120
+GCOB_PREAUTH_WINDOW_SECONDS=60
+GCOB_MAX_CONCURRENT_STREAMS=32
+GCOB_CONCURRENCY_LIMIT_PER_CONNECTION=16
+# Streaming/subscriber budgets (enforced from the streaming-hardening phase)
+GCOB_MAX_ACTIVE_STREAMS_GLOBAL=256
+GCOB_MAX_ACTIVE_STREAMS_PER_CLIENT=8
+GCOB_MAX_SUBSCRIBERS_GLOBAL=512
+GCOB_MAX_SUBSCRIBERS_PER_TYPE=256
+GCOB_SLOW_SUBSCRIBER_MAX_DROPS=64
 ```
 
 ## Development

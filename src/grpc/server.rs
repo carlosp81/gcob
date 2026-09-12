@@ -10,9 +10,12 @@ use crate::cln::client::ClnClient;
 use crate::cln::cln_api::node_services_server::NodeServicesServer;
 use crate::events::router::EventRouter;
 use crate::events::subscribers::ClnEventBridge;
+use crate::grpc::interceptors::admission_layer::AdmissionLayer;
 use crate::grpc::interceptors::auth_layer::AuthLayer;
+use crate::grpc::interceptors::identity::ClientIdentityLayer;
 use crate::grpc::interceptors::rate_limit_layer::RateLimitLayer;
 use crate::grpc::interceptors::rate_limiter::InMemoryRateLimiter;
+use crate::grpc::limits::Limits;
 
 pub struct ApiService {
     pub client: Arc<ClnClient>,
@@ -20,6 +23,7 @@ pub struct ApiService {
 }
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let limits = Limits::from_env().map_err(std::io::Error::other)?;
     let cert_config = ClnConfig::from_env()?;
     cert_config.validate_all()?;
     let client = ClnClient::connect(&cert_config).await?;
@@ -78,15 +82,33 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("gRPC API server listening on {}", addr);
 
-    let auth_layer = AuthLayer::new(api_service.client.clone());
+    let auth_layer = AuthLayer::new(api_service.client.clone(), limits.max_request_body_bytes);
+    let admission_layer = AdmissionLayer::new(redis_cm.clone(), in_memory_limiter.clone(), &limits);
     let rate_limit_layer = RateLimitLayer::new(redis_cm, in_memory_limiter);
+    let max_decoding_message_size = limits.max_request_body_bytes;
 
-    // Auth is the outermost layer: only authenticated requests consume quota.
+    // Layer order (outermost first): identity -> admission -> auth -> rate
+    // limit -> service. The pre-auth budget is consumed before any CLN
+    // interaction; only authenticated requests consume method quota.
+    //
+    // Transport limits bound per-connection resources independently of the
+    // application budgets; keepalive detects dead peers on idle streams.
     Server::builder()
         .tls_config(tls_config)?
+        .max_concurrent_streams(limits.max_concurrent_streams)
+        .concurrency_limit_per_connection(limits.concurrency_limit_per_connection)
+        .tcp_keepalive(Some(Duration::from_secs(60)))
+        .http2_keepalive_interval(Some(Duration::from_secs(30)))
+        .http2_keepalive_timeout(Some(Duration::from_secs(10)))
+        .http2_max_pending_accept_reset_streams(Some(limits.concurrency_limit_per_connection))
         .layer(rate_limit_layer)
         .layer(auth_layer)
-        .add_service(NodeServicesServer::new(api_service))
+        .layer(admission_layer)
+        .layer(ClientIdentityLayer::new())
+        .add_service(
+            NodeServicesServer::new(api_service)
+                .max_decoding_message_size(max_decoding_message_size),
+        )
         .serve_with_shutdown(addr, shutdown_signal(bridge_handle))
         .await?;
     Ok(())

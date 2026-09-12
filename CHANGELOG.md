@@ -1,5 +1,39 @@
 # Changelog
 
+## [Unreleased]
+
+Admission control hardened: certificate-bound rate limiting, a cheap
+pre-auth budget and bounded request bodies.
+
+### Added
+- `ClientIdentity` derived from the mTLS leaf certificate (SHA-256
+  fingerprint) and `ClientIdentityLayer`, the new outermost layer; requests
+  without a client certificate are rejected before any other processing
+- `AdmissionLayer`: per-fingerprint budget checked before `check_rune`, so
+  invalid runes no longer amplify backend load (GCOB-003)
+- `Limits` (`src/grpc/limits.rs`): environment-configurable availability
+  limits with validated defaults; zero or invalid values fail startup
+- Bounded body reads in `AuthLayer` (`GCOB_MAX_REQUEST_BODY_BYTES`) plus
+  `max_decoding_message_size` on the service (GCOB-007)
+- HTTP/2 transport limits: `max_concurrent_streams`,
+  `concurrency_limit_per_connection`, pending-accept-reset streams and
+  TCP/HTTP2 keepalive (GCOB-008, partial)
+- Structured rejection and audit logs with fingerprint, claimed client id,
+  remote address, path and latency
+- CI workflow (fmt, clippy `-D warnings`, tests) and
+  `security/availability-baseline.md`
+
+### Changed
+- Per-method rate limiting is keyed by certificate fingerprint instead of the
+  spoofable `x-client-id` header (GCOB-001); the header is optional audit
+  metadata and clients that omit it are no longer rejected
+- `AuthLayer::new` receives the body limit; body read errors no longer expose
+  upstream details
+
+### Fixed
+- Rate-limit and body-size rejections are logged as such instead of the
+  misleading "Auth rejected" message
+
 ## [0.5.2] - 2026-09-11
 
 Per-method rate limiting, ACL-aware certificate validation and error hardening.

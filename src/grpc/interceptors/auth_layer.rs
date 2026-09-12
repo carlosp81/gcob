@@ -4,7 +4,6 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use bytes::Bytes;
-use http_body_util::BodyExt;
 use prost::Message;
 use tonic::Status;
 use tower::{Layer, Service};
@@ -41,7 +40,7 @@ pub(crate) fn status_response(status: Status) -> http::Response<tonic::body::Bod
     tracing::warn!(
         code = ?status.code(),
         message = %status.message(),
-        "Auth rejected"
+        "gRPC request rejected"
     );
     status.into_http()
 }
@@ -80,16 +79,54 @@ fn extract_params_for_path(path: &str, body: &[u8]) -> Vec<String> {
     }
 }
 
+/// Read the request body up to `max_bytes`.
+///
+/// The limit is enforced while streaming so an oversized body is rejected
+/// before it is materialized or sent to CLN for rune validation.
+async fn read_body_limited(
+    mut body: tonic::body::Body,
+    max_bytes: usize,
+    path: &str,
+) -> Result<Bytes, Status> {
+    use http_body_util::BodyExt;
+
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|e| {
+            tracing::warn!(path = %path, error = %e, "Failed to read request body");
+            Status::internal("Failed to read request body")
+        })?;
+        if let Some(data) = frame.data_ref() {
+            if buf.len().saturating_add(data.len()) > max_bytes {
+                tracing::warn!(
+                    path = %path,
+                    max_body_bytes = max_bytes,
+                    "Request body exceeds the configured limit"
+                );
+                return Err(Status::resource_exhausted(format!(
+                    "Request body exceeds the {max_bytes} byte limit"
+                )));
+            }
+            buf.extend_from_slice(data);
+        }
+    }
+    Ok(Bytes::from(buf))
+}
+
 // --- Layer ---
 
 #[derive(Clone)]
 pub struct AuthLayer {
     client: Arc<ClnClient>,
+    max_body_bytes: usize,
 }
 
 impl AuthLayer {
-    pub fn new(client: Arc<ClnClient>) -> Self {
-        Self { client }
+    pub fn new(client: Arc<ClnClient>, max_body_bytes: usize) -> Self {
+        Self {
+            client,
+            max_body_bytes,
+        }
     }
 }
 
@@ -100,6 +137,7 @@ impl<S> Layer<S> for AuthLayer {
         AuthService {
             inner,
             client: self.client.clone(),
+            max_body_bytes: self.max_body_bytes,
         }
     }
 }
@@ -110,6 +148,7 @@ impl<S> Layer<S> for AuthLayer {
 pub struct AuthService<S> {
     inner: S,
     client: Arc<ClnClient>,
+    max_body_bytes: usize,
 }
 
 impl<S> Service<http::Request<tonic::body::Body>> for AuthService<S>
@@ -161,20 +200,18 @@ where
         };
 
         let client = self.client.clone();
+        let max_body_bytes = self.max_body_bytes;
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
             // Split request to read body
             let (parts, body) = req.into_parts();
 
-            // Collect body bytes for protobuf decoding
-            let body_bytes: Bytes = match body.collect().await {
-                Ok(collected) => collected.to_bytes(),
-                Err(e) => {
-                    return Ok(status_response(Status::internal(format!(
-                        "Failed to read request body: {e}"
-                    ))));
-                }
+            // Read body bytes for protobuf decoding, bounded before any CLN
+            // interaction so oversized requests cannot allocate arbitrarily.
+            let body_bytes = match read_body_limited(body, max_body_bytes, &path).await {
+                Ok(bytes) => bytes,
+                Err(status) => return Ok(status_response(status)),
             };
 
             // Extract params from protobuf body
@@ -415,7 +452,7 @@ mod tests {
             node_id: "test-node".to_string(),
         });
 
-        let mut service = AuthLayer::new(client).layer(service_fn(
+        let mut service = AuthLayer::new(client, 262_144).layer(service_fn(
             |_req: http::Request<tonic::body::Body>| async {
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>(http::Response::new(
                     tonic::body::Body::new(http_body_util::Full::new(Bytes::new())),
@@ -434,6 +471,135 @@ mod tests {
             .call(req)
             .await
             .expect("a rejected rune must produce a gRPC response, not a transport error");
+        assert_eq!(response.headers().get("grpc-status").unwrap(), "16");
+    }
+
+    // --- Body size limit tests (GCOB-007) ---
+
+    fn lazy_client() -> Arc<ClnClient> {
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        Arc::new(ClnClient {
+            inner: cln_api::node_client::NodeClient::new(channel),
+            node_id: "test-node".to_string(),
+        })
+    }
+
+    fn auth_request(path: &str, body: Bytes) -> http::Request<tonic::body::Body> {
+        let mut req = http::Request::new(tonic::body::Body::new(http_body_util::Full::new(body)));
+        req.headers_mut()
+            .insert(RUNE_HEADER, "some-rune".parse().unwrap());
+        *req.uri_mut() = path.parse().unwrap();
+        req
+    }
+
+    #[derive(Clone)]
+    struct CountingService {
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Service<http::Request<tonic::body::Body>> for CountingService {
+        type Response = http::Response<tonic::body::Body>;
+        type Error = Box<dyn std::error::Error + Send + Sync>;
+        type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _req: http::Request<tonic::body::Body>) -> Self::Future {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {
+                Ok(http::Response::new(tonic::body::Body::new(
+                    http_body_util::Full::new(Bytes::new()),
+                )))
+            })
+        }
+    }
+
+    fn counting_inner() -> (CountingService, Arc<std::sync::atomic::AtomicUsize>) {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        (
+            CountingService {
+                calls: calls.clone(),
+            },
+            calls,
+        )
+    }
+
+    #[tokio::test]
+    async fn oversized_body_is_rejected_before_any_backend_call() {
+        let (inner, calls) = counting_inner();
+        let mut service = AuthLayer::new(lazy_client(), 16).layer(inner);
+
+        let response = service
+            .call(auth_request(
+                "/cln.NodeServices/Getinfo",
+                Bytes::from_static(&[0u8; 32]),
+            ))
+            .await
+            .expect("must return a gRPC response");
+
+        assert_eq!(response.headers().get("grpc-status").unwrap(), "8");
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "inner service must never see an oversized request"
+        );
+    }
+
+    #[tokio::test]
+    async fn chunked_body_over_limit_is_rejected_while_streaming() {
+        use http_body_util::StreamBody;
+        use std::convert::Infallible;
+
+        let chunks = tokio_stream::iter(vec![
+            Ok::<_, Infallible>(http_body::Frame::data(Bytes::from_static(&[0u8; 10]))),
+            Ok::<_, Infallible>(http_body::Frame::data(Bytes::from_static(&[0u8; 10]))),
+        ]);
+        let body = tonic::body::Body::new(StreamBody::new(chunks));
+
+        let (inner, calls) = counting_inner();
+        let mut service = AuthLayer::new(lazy_client(), 16).layer(inner);
+
+        let mut req = http::Request::new(body);
+        req.headers_mut()
+            .insert(RUNE_HEADER, "some-rune".parse().unwrap());
+        *req.uri_mut() = "/cln.NodeServices/Getinfo".parse().unwrap();
+
+        let response = service.call(req).await.unwrap();
+        assert_eq!(response.headers().get("grpc-status").unwrap(), "8");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn body_at_limit_reaches_rune_check() {
+        let (inner, _calls) = counting_inner();
+        let mut service = AuthLayer::new(lazy_client(), 16).layer(inner);
+
+        let response = service
+            .call(auth_request(
+                "/cln.NodeServices/Getinfo",
+                Bytes::from_static(&[0u8; 16]),
+            ))
+            .await
+            .unwrap();
+
+        // Passed the size gate; the unreachable CLN produces status 16.
+        assert_eq!(response.headers().get("grpc-status").unwrap(), "16");
+    }
+
+    #[tokio::test]
+    async fn body_under_limit_reaches_rune_check() {
+        let (inner, _calls) = counting_inner();
+        let mut service = AuthLayer::new(lazy_client(), 16).layer(inner);
+
+        let response = service
+            .call(auth_request(
+                "/cln.NodeServices/Getinfo",
+                Bytes::from_static(&[0u8; 8]),
+            ))
+            .await
+            .unwrap();
         assert_eq!(response.headers().get("grpc-status").unwrap(), "16");
     }
 }

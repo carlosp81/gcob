@@ -7,8 +7,8 @@ use redis::aio::MultiplexedConnection;
 use tonic::Status;
 use tower::{Layer, Service};
 
-use crate::grpc::interceptors::auth::CLIENT_ID_HEADER;
 use crate::grpc::interceptors::auth_layer::{rune_method_for_path, status_response};
+use crate::grpc::interceptors::identity::{remote_addr_from_extensions, ClientIdentity};
 use crate::grpc::interceptors::rate_limiter::{
     check_rate_limit_with_fallback, policy_for_method, InMemoryRateLimiter,
 };
@@ -16,8 +16,11 @@ use crate::grpc::interceptors::rate_limiter::{
 /// Tower layer that enforces per-method rate limits before the service runs.
 ///
 /// Runs after the auth layer (auth wraps this one), so only authenticated
-/// requests consume quota. Streams are limited at subscription creation: the
-/// request that opens the stream is what gets counted, not each event.
+/// requests consume quota. The budget key is derived from the mTLS client
+/// certificate fingerprint, never from client-supplied headers, so renaming
+/// `x-client-id` cannot mint additional budgets. Streams are limited at
+/// subscription creation: the request that opens the stream is what gets
+/// counted, not each event.
 #[derive(Clone)]
 pub struct RateLimitLayer {
     redis_cm: Option<MultiplexedConnection>,
@@ -85,28 +88,35 @@ where
             return Box::pin(async move { inner.call(req).await.map_err(Into::into) });
         };
 
-        let client_id = req
-            .headers()
-            .get(CLIENT_ID_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .map(str::to_string)
-            .filter(|s| !s.is_empty());
-        let Some(client_id) = client_id else {
+        // Defense in depth: the identity layer rejects certificate-less
+        // requests before this layer, but a missing identity must never be
+        // treated as a fresh budget.
+        let Some(identity) = req.extensions().get::<ClientIdentity>().cloned() else {
             return Box::pin(async move {
-                Ok(status_response(Status::invalid_argument(format!(
-                    "Missing or empty '{CLIENT_ID_HEADER}' header required for rate limiting"
-                ))))
+                Ok(status_response(Status::unauthenticated(
+                    "Client certificate required",
+                )))
             });
         };
 
-        // Independent budget per method and client.
-        let key = format!("{method}:{client_id}");
+        // Independent budget per method and certificate fingerprint.
+        let key = format!("{method}:{}", identity.fingerprint_sha256);
+        let remote_addr = remote_addr_from_extensions(req.extensions());
         let redis_cm = self.redis_cm.clone();
         let fallback = self.fallback.clone();
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
             if !check_rate_limit_with_fallback(&redis_cm, &fallback, &key, policy).await {
+                tracing::warn!(
+                    fingerprint = %identity.fingerprint_sha256,
+                    claimed_client_id = identity.claimed_client_id.as_deref().unwrap_or("-"),
+                    remote_addr = ?remote_addr,
+                    method = %method,
+                    limit = policy.limit,
+                    window_seconds = policy.window_seconds,
+                    "Rate limit exceeded"
+                );
                 return Ok(status_response(Status::resource_exhausted(format!(
                     "Rate limit exceeded for '{method}' ({} per {}s)",
                     policy.limit, policy.window_seconds
@@ -124,6 +134,8 @@ mod tests {
 
     use bytes::Bytes;
     use http_body_util::Full;
+
+    use crate::grpc::interceptors::auth::CLIENT_ID_HEADER;
 
     #[derive(Clone)]
     struct CountingService {
@@ -159,13 +171,22 @@ mod tests {
         )
     }
 
-    fn request(path: &str, client_id: Option<&str>) -> http::Request<tonic::body::Body> {
+    fn request(path: &str, fingerprint: Option<&str>) -> http::Request<tonic::body::Body> {
         let mut req = http::Request::new(tonic::body::Body::new(Full::new(Bytes::new())));
         *req.uri_mut() = path.parse().unwrap();
-        if let Some(id) = client_id {
-            req.headers_mut()
-                .insert(CLIENT_ID_HEADER, id.parse().unwrap());
+        if let Some(fingerprint) = fingerprint {
+            req.extensions_mut()
+                .insert(ClientIdentity::new(fingerprint));
         }
+        req
+    }
+
+    fn with_claim(
+        mut req: http::Request<tonic::body::Body>,
+        claim: &str,
+    ) -> http::Request<tonic::body::Body> {
+        req.headers_mut()
+            .insert(CLIENT_ID_HEADER, claim.parse().unwrap());
         req
     }
 
@@ -176,14 +197,14 @@ mod tests {
 
         for _ in 0..3 {
             assert!(service
-                .call(request("/cln.NodeServices/Xpay", Some("client-1")))
+                .call(request("/cln.NodeServices/Xpay", Some("cert-a")))
                 .await
                 .is_ok());
         }
         assert_eq!(calls.load(Ordering::SeqCst), 3);
 
         let response = service
-            .call(request("/cln.NodeServices/Xpay", Some("client-1")))
+            .call(request("/cln.NodeServices/Xpay", Some("cert-a")))
             .await
             .expect("rate limit must produce a gRPC response, not a transport error");
         assert_eq!(response.headers().get("grpc-status").unwrap(), "8");
@@ -191,7 +212,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_client_id_is_rejected() {
+    async fn missing_identity_is_rejected() {
         let (inner, calls) = counting_service();
         let mut service = RateLimitLayer::new(None, InMemoryRateLimiter::new()).layer(inner);
 
@@ -199,7 +220,7 @@ mod tests {
             .call(request("/cln.NodeServices/Xpay", None))
             .await
             .unwrap();
-        assert_eq!(response.headers().get("grpc-status").unwrap(), "3");
+        assert_eq!(response.headers().get("grpc-status").unwrap(), "16");
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
@@ -210,19 +231,19 @@ mod tests {
 
         for _ in 0..3 {
             service
-                .call(request("/cln.NodeServices/Xpay", Some("client-1")))
+                .call(request("/cln.NodeServices/Xpay", Some("cert-a")))
                 .await
                 .unwrap();
         }
         let blocked = service
-            .call(request("/cln.NodeServices/Xpay", Some("client-1")))
+            .call(request("/cln.NodeServices/Xpay", Some("cert-a")))
             .await
             .unwrap();
         assert_eq!(blocked.headers().get("grpc-status").unwrap(), "8");
 
         // A different method for the same client still has its own budget.
         let allowed = service
-            .call(request("/cln.NodeServices/Getinfo", Some("client-1")))
+            .call(request("/cln.NodeServices/Getinfo", Some("cert-a")))
             .await
             .unwrap();
         assert!(allowed.headers().get("grpc-status").is_none());
@@ -239,5 +260,66 @@ mod tests {
             .unwrap();
         assert!(response.headers().get("grpc-status").is_none());
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// GCOB-001 regression: one certificate cannot mint budgets by renaming
+    /// the `x-client-id` header.
+    #[tokio::test]
+    async fn spoofed_client_id_claims_share_one_budget() {
+        let (inner, calls) = counting_service();
+        let mut service = RateLimitLayer::new(None, InMemoryRateLimiter::new()).layer(inner);
+
+        for i in 0..3 {
+            let req = with_claim(
+                request("/cln.NodeServices/Xpay", Some("cert-a")),
+                &format!("attacker-{i:06}"),
+            );
+            let response = service.call(req).await.unwrap();
+            assert!(response.headers().get("grpc-status").is_none());
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        for i in 3..20 {
+            let req = with_claim(
+                request("/cln.NodeServices/Xpay", Some("cert-a")),
+                &format!("attacker-{i:06}"),
+            );
+            let response = service.call(req).await.unwrap();
+            assert_eq!(
+                response.headers().get("grpc-status").unwrap(),
+                "8",
+                "claim {i} must not create a new budget"
+            );
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "only the certificate budget may be consumed"
+        );
+    }
+
+    #[tokio::test]
+    async fn different_fingerprints_have_independent_budgets() {
+        let (inner, calls) = counting_service();
+        let mut service = RateLimitLayer::new(None, InMemoryRateLimiter::new()).layer(inner);
+
+        for _ in 0..3 {
+            service
+                .call(request("/cln.NodeServices/Xpay", Some("cert-a")))
+                .await
+                .unwrap();
+        }
+        let blocked = service
+            .call(request("/cln.NodeServices/Xpay", Some("cert-a")))
+            .await
+            .unwrap();
+        assert_eq!(blocked.headers().get("grpc-status").unwrap(), "8");
+
+        let other = service
+            .call(request("/cln.NodeServices/Xpay", Some("cert-b")))
+            .await
+            .unwrap();
+        assert!(other.headers().get("grpc-status").is_none());
+        assert_eq!(calls.load(Ordering::SeqCst), 4);
     }
 }
