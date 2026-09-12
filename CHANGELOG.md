@@ -1,6 +1,6 @@
 # Changelog
 
-## [Unreleased]
+## [0.5.3] - 2026-09-12
 
 Admission control hardened: certificate-bound rate limiting, a cheap
 pre-auth budget and bounded request bodies.
