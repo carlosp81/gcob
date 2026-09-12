@@ -64,6 +64,9 @@ impl ClnClient {
         tracing::info!("Node ID: {}", node_id);
         tracing::info!("Successfully connected to CLN via mTLS over Unix socket — TLS ENABLED (server cert + client CA verification)");
 
-        Ok(Self { inner: client, node_id })
+        Ok(Self {
+            inner: client,
+            node_id,
+        })
     }
 }

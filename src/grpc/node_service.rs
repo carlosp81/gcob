@@ -74,8 +74,8 @@ impl NodeServices for ApiService {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        let internal_event = crate::events::types::Event::Invoice(
-            crate::events::types::InvoiceEvent::Created {
+        let internal_event =
+            crate::events::types::Event::Invoice(crate::events::types::InvoiceEvent::Created {
                 event_id: format!("cln-inv-stream-{}", req_label),
                 timestamp: now,
                 label: req_label.clone(),
@@ -83,30 +83,30 @@ impl NodeServices for ApiService {
                 description: req_description.clone(),
                 bolt11: cln_res.bolt11.clone(),
                 expiry: req_expiry,
-            },
-        );
+            });
         let proto_created = crate::domain::invoice::watch::to_proto_event(&internal_event)
             .unwrap_or_else(|| {
                 tracing::warn!("Failed to convert InvoiceCreated to proto");
                 cln_api::Event {
-                    event: Some(cln_api::event::Event::InvoiceCreated(cln_api::InvoiceCreated {
-                        event_id: format!("cln-inv-stream-{}", req_label),
-                        timestamp: now,
-                        label: req_label.clone(),
-                        amount_msat: req_amount,
-                        description: req_description,
-                        bolt11: cln_res.bolt11.clone(),
-                        recommendation: String::new(),
-                        expiry: req_expiry,
-                    })),
+                    event: Some(cln_api::event::Event::InvoiceCreated(
+                        cln_api::InvoiceCreated {
+                            event_id: format!("cln-inv-stream-{}", req_label),
+                            timestamp: now,
+                            label: req_label.clone(),
+                            amount_msat: req_amount,
+                            description: req_description,
+                            bolt11: cln_res.bolt11.clone(),
+                            recommendation: String::new(),
+                            expiry: req_expiry,
+                        },
+                    )),
                 }
             });
 
         // 4. Suscribir a "invoice" y crear canales
         let (internal_tx, mut internal_rx) =
             tokio::sync::mpsc::channel::<crate::events::types::Event>(64);
-        let (proto_tx, proto_rx) =
-            tokio::sync::mpsc::channel::<Result<cln_api::Event, Status>>(64);
+        let (proto_tx, proto_rx) = tokio::sync::mpsc::channel::<Result<cln_api::Event, Status>>(64);
 
         let router = self.event_router.clone();
         let subscriber_id = next_subscriber_id();
@@ -188,8 +188,7 @@ impl NodeServices for ApiService {
         // 4. Suscribir a "payment" y crear canales
         let (internal_tx, mut internal_rx) =
             tokio::sync::mpsc::channel::<crate::events::types::Event>(64);
-        let (proto_tx, proto_rx) =
-            tokio::sync::mpsc::channel::<Result<cln_api::Event, Status>>(64);
+        let (proto_tx, proto_rx) = tokio::sync::mpsc::channel::<Result<cln_api::Event, Status>>(64);
 
         let router = self.event_router.clone();
         let subscriber_id = next_subscriber_id();
@@ -212,14 +211,10 @@ impl NodeServices for ApiService {
             while let Some(event) = internal_rx.recv().await {
                 let matches = match &event {
                     crate::events::types::Event::Payment(
-                        crate::events::types::PaymentEvent::Succeeded {
-                            payment_hash, ..
-                        },
+                        crate::events::types::PaymentEvent::Succeeded { payment_hash, .. },
                     ) => payment_hash == &target_hash,
                     crate::events::types::Event::Payment(
-                        crate::events::types::PaymentEvent::Failed {
-                            payment_hash, ..
-                        },
+                        crate::events::types::PaymentEvent::Failed { payment_hash, .. },
                     ) => payment_hash == &target_hash,
                     _ => false,
                 };

@@ -7,10 +7,7 @@ use tonic::transport::Channel;
 use super::super::types::*;
 
 pub async fn run(client: &mut NodeClient<Channel>, tx: mpsc::Sender<Event>) {
-    let mut connect_stream = match client
-        .subscribe_connect(StreamConnectRequest {})
-        .await
-    {
+    let mut connect_stream = match client.subscribe_connect(StreamConnectRequest {}).await {
         Ok(resp) => resp.into_inner(),
         Err(e) => {
             tracing::warn!("subscribe_connect failed: {}", e);
