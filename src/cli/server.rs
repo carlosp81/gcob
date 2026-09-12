@@ -136,13 +136,3 @@ pub async fn handle_serve() -> Result<(), Box<dyn std::error::Error>> {
 
     crate::grpc::server::run().await
 }
-
-/// Handle `gcob certs`
-#[allow(dead_code)]
-pub fn handle_certs() -> Result<(), CertError> {
-    println!("=== Certificate status ===");
-    // TODO: Implement certificate expiry check
-    println!("  Checking certificate expiration...");
-    println!("  [TODO] Not yet implemented");
-    Ok(())
-}

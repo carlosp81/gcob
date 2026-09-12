@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use super::types::*;
 
 const NODE_ID_MAX_LEN: usize = 8;

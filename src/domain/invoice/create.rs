@@ -25,7 +25,10 @@ pub(crate) async fn create_invoice(
     let cln_response = cln_client
         .invoice(Request::new(cln_request))
         .await
-        .map_err(|e| Status::internal(format!("Upstream CLN error: {}", e)))?;
+        .map_err(|e| {
+            tracing::error!(error = %e, "CLN invoice failed");
+            Status::internal("Internal error")
+        })?;
 
     let cln_res = cln_response.into_inner();
 
@@ -43,4 +46,21 @@ pub(crate) async fn create_invoice(
     };
 
     Ok(Response::new(response))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cln::api_test_support::unreachable_client;
+
+    #[tokio::test]
+    async fn upstream_error_is_sanitized() {
+        let client = unreachable_client();
+        let request = Request::new(cln_api::InvoiceRequest {
+            label: "test".to_string(),
+            ..Default::default()
+        });
+        let status = create_invoice(&client, request).await.unwrap_err();
+        assert_eq!(status.message(), "Internal error");
+    }
 }

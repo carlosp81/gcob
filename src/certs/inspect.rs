@@ -89,27 +89,14 @@ pub fn days_until_expiry(path: &Path) -> Result<i64, CertError> {
         .unwrap_or(-1))
 }
 
-/// Check if a certificate is valid (not expired)
-#[allow(dead_code)]
-pub fn is_valid(path: &Path) -> Result<bool, CertError> {
-    let days = days_until_expiry(path)?;
-    Ok(days > 0)
-}
-
 /// Result of chain verification for a single certificate
 #[derive(Debug)]
 pub struct ChainResult {
-    #[allow(dead_code)]
-    pub cert_file: String,
     pub subject: String,
     pub issuer: String,
     pub signed_by_ca: bool,
-    #[allow(dead_code)]
-    pub ca_subject: String,
     pub expired: bool,
     pub days_remaining: i64,
-    #[allow(dead_code)]
-    pub san_match: Option<bool>,
     pub errors: Vec<String>,
 }
 /// Verify that a certificate is cryptographically signed by a CA.
@@ -187,14 +174,11 @@ pub fn verify_signed_by(cert_path: &Path, ca_path: &Path) -> Result<ChainResult,
     }
 
     Ok(ChainResult {
-        cert_file: cert_path.display().to_string(),
         subject: cert_subject,
         issuer: cert_issuer,
         signed_by_ca,
-        ca_subject,
         expired,
         days_remaining,
-        san_match: None,
         errors,
     })
 }
@@ -290,40 +274,6 @@ pub fn check_san_match(cert_path: &Path, expected_hostname: &str) -> Result<bool
     }
 
     Ok(false)
-}
-
-/// Verify full chain: CA → server, CA → client, SAN match
-#[allow(dead_code)]
-pub fn verify_chain(
-    cert_dir: &Path,
-    expected_hostname: &str,
-) -> Result<Vec<ChainResult>, CertError> {
-    let ca_path = cert_dir.join("ca.pem");
-    let server_path = cert_dir.join("server.pem");
-    let client_path = cert_dir.join("client.pem");
-
-    let mut results = Vec::new();
-
-    // Verify server cert
-    if server_path.exists() {
-        let mut result = verify_signed_by(&server_path, &ca_path)?;
-        result.san_match = Some(check_san_match(&server_path, expected_hostname)?);
-        if result.san_match == Some(false) {
-            result.errors.push(format!(
-                "SAN does not match expected hostname '{}'",
-                expected_hostname
-            ));
-        }
-        results.push(result);
-    }
-
-    // Verify client cert
-    if client_path.exists() {
-        let result = verify_signed_by(&client_path, &ca_path)?;
-        results.push(result);
-    }
-
-    Ok(results)
 }
 
 #[cfg(test)]

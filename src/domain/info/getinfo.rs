@@ -11,10 +11,10 @@ pub(crate) async fn get_info(
     let req = request.into_inner();
 
     let mut cln_client = client.inner.clone();
-    let client_response = cln_client
-        .getinfo(req)
-        .await
-        .map_err(|e| Status::internal(format!("Upstream CLN error: {}", e)))?;
+    let client_response = cln_client.getinfo(req).await.map_err(|e| {
+        tracing::error!(error = %e, "CLN getinfo failed");
+        Status::internal("Internal error")
+    })?;
 
     let cln_res = client_response.into_inner();
 
@@ -39,4 +39,19 @@ pub(crate) async fn get_info(
     };
 
     Ok(Response::new(res))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cln::api_test_support::unreachable_client;
+
+    #[tokio::test]
+    async fn upstream_error_is_sanitized() {
+        let client = unreachable_client();
+        let status = get_info(&client, Request::new(cln_api::GetinfoRequest::default()))
+            .await
+            .unwrap_err();
+        assert_eq!(status.message(), "Internal error");
+    }
 }

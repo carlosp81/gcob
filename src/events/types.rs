@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 /// Unique identifier for each event instance.
 pub type EventId = String;
 

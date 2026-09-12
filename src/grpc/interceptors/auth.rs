@@ -20,6 +20,7 @@ pub(crate) fn extract_rune_from_request<T>(request: &Request<T>) -> Option<Strin
         .filter(|s| !s.is_empty())
 }
 
+#[cfg(test)]
 pub(crate) fn extract_client_id<T>(request: &Request<T>) -> Option<String> {
     request
         .metadata()
@@ -98,7 +99,10 @@ mod tests {
     #[test]
     fn extract_rune_present() {
         let req = request_with_rune("my-valid-rune-123");
-        assert_eq!(extract_rune_from_request(&req), Some("my-valid-rune-123".into()));
+        assert_eq!(
+            extract_rune_from_request(&req),
+            Some("my-valid-rune-123".into())
+        );
     }
 
     #[test]
@@ -211,7 +215,10 @@ mod tests {
         let rune = extract_rune_from_request(&req);
         // Whitespace is not empty, so it passes filter - this is expected behavior
         // CLN's check_rune will validate the actual rune
-        assert!(rune.is_some(), "Whitespace rune passes extraction (CLN validates)");
+        assert!(
+            rune.is_some(),
+            "Whitespace rune passes extraction (CLN validates)"
+        );
     }
 
     // --- Rune alteration tests ---
@@ -315,9 +322,11 @@ mod tests {
         // This confirms our extraction only works with lowercase "x-rune"
         let result = std::panic::catch_unwind(|| {
             let mut req = Request::new(());
-            req.metadata_mut()
-                .insert("X-RUNE", "test".parse().unwrap());
+            req.metadata_mut().insert("X-RUNE", "test".parse().unwrap());
         });
-        assert!(result.is_err(), "Uppercase header names are rejected by HTTP/2 layer");
+        assert!(
+            result.is_err(),
+            "Uppercase header names are rejected by HTTP/2 layer"
+        );
     }
 }

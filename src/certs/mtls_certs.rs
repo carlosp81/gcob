@@ -5,7 +5,6 @@ use tonic::Status;
 
 #[derive(Debug, Clone)]
 pub struct ClnConfig {
-    #[allow(dead_code)]
     pub cert_dir: PathBuf,
     pub ca_file: PathBuf,
     pub client_file: PathBuf,
@@ -83,15 +82,12 @@ impl ClnConfig {
             match crate::certs::paths::is_gcob_user() {
                 Ok(true) => {}
                 Ok(false) => {
-                    return Err(Status::permission_denied(
-                        "Only user 'gcob' can start the API",
-                    ));
+                    tracing::error!("Unauthorized user attempted to start the API");
+                    return Err(Status::permission_denied("Unauthorized"));
                 }
                 Err(e) => {
-                    return Err(Status::permission_denied(format!(
-                        "Cannot verify service user: {}",
-                        e
-                    )));
+                    tracing::error!(error = %e, "Cannot verify the API service user");
+                    return Err(Status::permission_denied("Unauthorized"));
                 }
             }
         }
@@ -100,35 +96,34 @@ impl ClnConfig {
 
     fn validate_cert_dir(path: &Path) -> Result<(), Status> {
         if !path.exists() {
-            return Err(Status::failed_precondition(format!(
-                "Certificate directory does not exist: {}",
-                path.display()
-            )));
+            tracing::error!(path = %path.display(), "Certificate directory does not exist");
+            return Err(Status::failed_precondition(
+                "Invalid certificate configuration",
+            ));
         }
         if !path.is_dir() {
-            return Err(Status::failed_precondition(format!(
-                "Certificate path is not a directory: {}",
-                path.display()
-            )));
+            tracing::error!(path = %path.display(), "Certificate path is not a directory");
+            return Err(Status::failed_precondition(
+                "Invalid certificate configuration",
+            ));
         }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let metadata = std::fs::metadata(path).map_err(|e| {
-                Status::internal(format!(
-                    "Error reading metadata of {}: {}",
-                    path.display(),
-                    e
-                ))
+                tracing::error!(path = %path.display(), error = %e, "Cannot read certificate directory metadata");
+                Status::internal("Internal error")
             })?;
-            let mode = metadata.permissions().mode();
-            if mode & 0o077 != 0 {
-                return Err(Status::failed_precondition(format!(
-                    "Directory {} has permissions {:o} — should be 0700. Run: chmod 0700 {}",
-                    path.display(),
-                    mode & 0o777,
-                    path.display()
-                )));
+            let mode = metadata.permissions().mode() & 0o777;
+            if !crate::certs::paths::effective_perms_are_owner_only(path, mode, 0o077) {
+                tracing::error!(
+                    path = %path.display(),
+                    mode = format_args!("{mode:04o}"),
+                    "Certificate directory is accessible by group/other"
+                );
+                return Err(Status::failed_precondition(
+                    "Invalid certificate configuration",
+                ));
             }
         }
         Ok(())
@@ -136,36 +131,35 @@ impl ClnConfig {
 
     fn validate_cert(path: &Path, is_private_key: bool) -> Result<(), Status> {
         if !path.exists() {
-            return Err(Status::failed_precondition(format!(
-                "Certificate not found: {}",
-                path.display()
-            )));
+            tracing::error!(path = %path.display(), "Certificate file not found");
+            return Err(Status::failed_precondition(
+                "Invalid certificate configuration",
+            ));
         }
         if !path.is_file() {
-            return Err(Status::failed_precondition(format!(
-                "Path is not a file: {}",
-                path.display()
-            )));
+            tracing::error!(path = %path.display(), "Certificate path is not a file");
+            return Err(Status::failed_precondition(
+                "Invalid certificate configuration",
+            ));
         }
         if is_private_key {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 let metadata = std::fs::metadata(path).map_err(|e| {
-                    Status::internal(format!(
-                        "Error reading metadata of {}: {}",
-                        path.display(),
-                        e
-                    ))
+                    tracing::error!(path = %path.display(), error = %e, "Cannot read private key metadata");
+                    Status::internal("Internal error")
                 })?;
-                let mode = metadata.permissions().mode();
-                if mode & 0o077 != 0 {
-                    return Err(Status::failed_precondition(format!(
-                        "Private key {} has permissions {:o} — should be 0400. Run: chmod 0400 {}",
-                        path.display(),
-                        mode & 0o777,
-                        path.display()
-                    )));
+                let mode = metadata.permissions().mode() & 0o777;
+                if !crate::certs::paths::effective_perms_are_owner_only(path, mode, 0o077) {
+                    tracing::error!(
+                        path = %path.display(),
+                        mode = format_args!("{mode:04o}"),
+                        "Private key is readable by group/other"
+                    );
+                    return Err(Status::failed_precondition(
+                        "Invalid certificate configuration",
+                    ));
                 }
             }
         }
@@ -205,5 +199,120 @@ mod tests {
             Ok(path) => assert!(path.ends_with(".certs"), "{path:?}"),
             Err(e) => assert!(e.contains("CLN_CERT_DIR"), "{e}"),
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_cert_dir_accepts_acl_named_user_grant() {
+        use crate::certs::paths::test_support::{
+            set_access_acl, TAG_GROUP_OBJ, TAG_MASK, TAG_OTHER, TAG_USER, TAG_USER_OBJ,
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("certs");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let account = crate::certs::paths::current_account().unwrap();
+        let acl = [
+            (TAG_USER_OBJ, 7, u32::MAX),
+            (TAG_USER, 5, account.uid), // named user: r-x
+            (TAG_GROUP_OBJ, 0, u32::MAX),
+            (TAG_MASK, 5, u32::MAX), // stat now reports 0750
+            (TAG_OTHER, 0, u32::MAX),
+        ];
+        if !set_access_acl(&dir, &acl) {
+            return; // filesystem without POSIX ACL support
+        }
+        assert!(ClnConfig::validate_cert_dir(&dir).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_cert_dir_rejects_broad_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("certs");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(ClnConfig::validate_cert_dir(&dir).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_private_key_accepts_acl_named_user_grant() {
+        use crate::certs::paths::test_support::{
+            set_access_acl, TAG_GROUP_OBJ, TAG_MASK, TAG_OTHER, TAG_USER, TAG_USER_OBJ,
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let key = base.path().join("client-key.pem");
+        std::fs::write(&key, b"key").unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+        let account = crate::certs::paths::current_account().unwrap();
+        let acl = [
+            (TAG_USER_OBJ, 6, u32::MAX),
+            (TAG_USER, 4, account.uid), // named user: r--
+            (TAG_GROUP_OBJ, 0, u32::MAX),
+            (TAG_MASK, 4, u32::MAX), // stat now reports 0440
+            (TAG_OTHER, 0, u32::MAX),
+        ];
+        if !set_access_acl(&key, &acl) {
+            return;
+        }
+        assert!(ClnConfig::validate_cert(&key, true).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_private_key_rejects_broad_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let key = base.path().join("client-key.pem");
+        std::fs::write(&key, b"key").unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o440)).unwrap();
+        assert!(ClnConfig::validate_cert(&key, true).is_err());
+    }
+
+    #[test]
+    fn validate_cert_dir_error_does_not_leak_paths() {
+        let base = tempfile::tempdir().unwrap();
+        let missing = base.path().join("missing");
+        let status = ClnConfig::validate_cert_dir(&missing).unwrap_err();
+        assert_eq!(status.message(), "Invalid certificate configuration");
+        assert!(!status.message().contains("missing"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_cert_dir_permission_error_does_not_leak_paths() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("certs");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let status = ClnConfig::validate_cert_dir(&dir).unwrap_err();
+        assert_eq!(status.message(), "Invalid certificate configuration");
+        assert!(!status.message().contains("certs"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_private_key_error_does_not_leak_paths() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let key = base.path().join("client-key.pem");
+        std::fs::write(&key, b"key").unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let status = ClnConfig::validate_cert(&key, true).unwrap_err();
+        assert_eq!(status.message(), "Invalid certificate configuration");
+        assert!(!status.message().contains("client-key"));
     }
 }

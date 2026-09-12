@@ -11,10 +11,10 @@ pub(crate) async fn xpay(
     let req = request.into_inner();
 
     let mut cln_client = client.inner.clone();
-    let client_response = cln_client
-        .xpay(req)
-        .await
-        .map_err(|e| Status::internal(format!("Upstream CLN error: {}", e)))?;
+    let client_response = cln_client.xpay(req).await.map_err(|e| {
+        tracing::error!(error = %e, "CLN xpay failed");
+        Status::internal("Internal error")
+    })?;
 
     let cln_res = client_response.into_inner();
 
@@ -27,4 +27,21 @@ pub(crate) async fn xpay(
     };
 
     Ok(Response::new(res))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cln::api_test_support::unreachable_client;
+
+    #[tokio::test]
+    async fn upstream_error_is_sanitized() {
+        let client = unreachable_client();
+        let request = Request::new(cln_api::XpayRequest {
+            invstring: "lnbc1...".to_string(),
+            ..Default::default()
+        });
+        let status = xpay(&client, request).await.unwrap_err();
+        assert_eq!(status.message(), "Internal error");
+    }
 }

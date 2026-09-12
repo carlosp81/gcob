@@ -16,7 +16,7 @@ use super::auth::{validate_rune, RUNE_HEADER};
 
 // --- Path → CLN method name mapping ---
 
-fn rune_method_for_path(path: &str) -> Option<&'static str> {
+pub(crate) fn rune_method_for_path(path: &str) -> Option<&'static str> {
     match path {
         "/cln.NodeServices/Invoice" => Some("invoice"),
         "/cln.NodeServices/Getinfo" => Some("getinfo"),
@@ -37,7 +37,7 @@ fn rune_method_for_path(path: &str) -> Option<&'static str> {
 /// Returning `Err` from the tower service is treated by hyper as a fatal
 /// connection error (`RST_STREAM`), which the client reports as
 /// "h2 protocol error" instead of the real gRPC status.
-fn status_response(status: Status) -> http::Response<tonic::body::Body> {
+pub(crate) fn status_response(status: Status) -> http::Response<tonic::body::Body> {
     tracing::warn!(
         code = ?status.code(),
         message = %status.message(),

@@ -52,7 +52,7 @@ async fn main() -> Result<()> {
             let client_id = cli.client_id.as_deref().unwrap_or("gcob-client");
 
             match command {
-                Commands::Info => commands::info::run(channel, rune).await,
+                Commands::Info => commands::info::run(channel, rune, client_id).await,
                 Commands::Invoice {
                     label,
                     amount,
@@ -73,7 +73,9 @@ async fn main() -> Result<()> {
                 Commands::Xpay { invoice, maxfee } => {
                     commands::xpay::run(channel, rune, client_id, &invoice, maxfee.as_deref()).await
                 }
-                Commands::Watch { target } => commands::watch::run(channel, rune, target).await,
+                Commands::Watch { target } => {
+                    commands::watch::run(channel, rune, client_id, target).await
+                }
                 Commands::Init { .. } => unreachable!("handled above"),
             }
         }

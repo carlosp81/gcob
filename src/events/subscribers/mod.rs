@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 pub mod channel;
 pub mod invoice;
 pub mod payment;

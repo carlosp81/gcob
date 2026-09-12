@@ -3,7 +3,7 @@ use clap::Parser;
 mod cli;
 
 // Re-export library modules so cli/* can use crate::certs, crate::cln, etc.
-pub use gcob::{certs, cln, config, domain, events, grpc, infra};
+pub use gcob::{certs, cln, config, domain, events, grpc};
 
 use cli::{Cli, Commands};
 

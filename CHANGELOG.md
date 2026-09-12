@@ -2,7 +2,15 @@
 
 ## [Unreleased]
 
+### Added
+- `RateLimitLayer` (tower, HTTP layer) with independent per-method budgets:
+  `invoice`/`xpay` 3/hour, `getinfo` 60/hour and stream subscriptions 12/hour
+  per `x-client-id`; Redis primary with in-memory token-bucket fallback
+
 ### Changed
+- Rate limiting now covers `xpay`, `getinfo` and the five watch RPCs (it was
+  only `invoice`/`invoice_stream`); limited methods require `x-client-id`
+- `gcob-client info` and `gcob-client watch` now send `x-client-id`
 - Certificate lookup defaults to the admin account's `~/.certs`: `CLN_CERT_DIR`
   may be omitted for `gcob serve`, and `gcob-client` resolves `ca.pem`,
   `client.pem` and `client-key.pem` there when no `--ca/--cert/--key` or
@@ -12,6 +20,23 @@
 - Auth middleware returns a proper `Unauthenticated` gRPC status for rejected
   runes (invalid or blacklisted) instead of resetting the HTTP/2 stream, which
   the client surfaced as `h2 protocol error ... INTERNAL_ERROR`
+- `gcob-client` help no longer prints the current `GCOD_*` environment values:
+  a rune or client id loaded from the trusted env file is not leaked into
+  terminals or logs
+- Server startup validation and host-role detection now accept POSIX ACL
+  named-user grants (e.g. `gcob`) and reject only broad group/other
+  permissions, so an ACL-hardened certificate directory no longer breaks
+  `gcob serve` (`ClnConfig::validate_all`, `is_server_env`)
+- Remote gRPC clients no longer receive upstream CLN error details: `Getinfo`,
+  `Invoice`, `Xpay` and `XpayStreamWatch` return a generic `Internal error` and
+  log the cause locally
+- Certificate configuration errors no longer expose filesystem paths,
+  permissions or the service user; details are logged with `tracing::error!`
+
+### Removed
+- Dead code: unused `handle_certs` stub, `ClnSourcePaths.server_key_file`,
+  the `infra`/`valkey` module, `inspect::is_valid`, `inspect::verify_chain`,
+  unread `ChainResult` fields and stale `#[allow(dead_code)]` markers
 
 ## [0.5.1] - 2026-09-11
 

@@ -9,7 +9,7 @@ use crate::cli::WatchTarget;
 
 use super::{insert_header, sanitize, truncate_utf8};
 
-pub async fn run(channel: Channel, rune: &str, target: WatchTarget) -> Result<()> {
+pub async fn run(channel: Channel, rune: &str, client_id: &str, target: WatchTarget) -> Result<()> {
     let mut client = NodeServicesClient::new(channel);
 
     let now = chrono::Local::now().format("[%Y-%m-%d %H:%M:%S]");
@@ -20,22 +20,27 @@ pub async fn run(channel: Channel, rune: &str, target: WatchTarget) -> Result<()
     );
 
     match target {
-        WatchTarget::Payment => watch_payments(&mut client, rune).await,
-        WatchTarget::Invoice => watch_invoices(&mut client, rune).await,
-        WatchTarget::Channel => watch_channels(&mut client, rune).await,
-        WatchTarget::Peer => watch_peers(&mut client, rune).await,
-        WatchTarget::System => watch_system(&mut client, rune).await,
+        WatchTarget::Payment => watch_payments(&mut client, rune, client_id).await,
+        WatchTarget::Invoice => watch_invoices(&mut client, rune, client_id).await,
+        WatchTarget::Channel => watch_channels(&mut client, rune, client_id).await,
+        WatchTarget::Peer => watch_peers(&mut client, rune, client_id).await,
+        WatchTarget::System => watch_system(&mut client, rune, client_id).await,
     }
 }
 
-fn with_rune(rune: &str) -> Result<Request<()>> {
+fn with_auth(rune: &str, client_id: &str) -> Result<Request<()>> {
     let mut request = Request::new(());
     insert_header(request.metadata_mut(), "x-rune", rune)?;
+    insert_header(request.metadata_mut(), "x-client-id", client_id)?;
     Ok(request)
 }
 
-async fn watch_payments(client: &mut NodeServicesClient<Channel>, rune: &str) -> Result<()> {
-    let request = with_rune(rune)?;
+async fn watch_payments(
+    client: &mut NodeServicesClient<Channel>,
+    rune: &str,
+    client_id: &str,
+) -> Result<()> {
+    let request = with_auth(rune, client_id)?;
     let mut stream = client
         .xpay_stream(request)
         .await
@@ -50,8 +55,12 @@ async fn watch_payments(client: &mut NodeServicesClient<Channel>, rune: &str) ->
     Ok(())
 }
 
-async fn watch_invoices(client: &mut NodeServicesClient<Channel>, rune: &str) -> Result<()> {
-    let request = with_rune(rune)?;
+async fn watch_invoices(
+    client: &mut NodeServicesClient<Channel>,
+    rune: &str,
+    client_id: &str,
+) -> Result<()> {
+    let request = with_auth(rune, client_id)?;
     let mut stream = client
         .invoice_watch(request)
         .await
@@ -66,8 +75,12 @@ async fn watch_invoices(client: &mut NodeServicesClient<Channel>, rune: &str) ->
     Ok(())
 }
 
-async fn watch_channels(client: &mut NodeServicesClient<Channel>, rune: &str) -> Result<()> {
-    let request = with_rune(rune)?;
+async fn watch_channels(
+    client: &mut NodeServicesClient<Channel>,
+    rune: &str,
+    client_id: &str,
+) -> Result<()> {
+    let request = with_auth(rune, client_id)?;
     let mut stream = client
         .watch_channels(request)
         .await
@@ -82,8 +95,12 @@ async fn watch_channels(client: &mut NodeServicesClient<Channel>, rune: &str) ->
     Ok(())
 }
 
-async fn watch_peers(client: &mut NodeServicesClient<Channel>, rune: &str) -> Result<()> {
-    let request = with_rune(rune)?;
+async fn watch_peers(
+    client: &mut NodeServicesClient<Channel>,
+    rune: &str,
+    client_id: &str,
+) -> Result<()> {
+    let request = with_auth(rune, client_id)?;
     let mut stream = client
         .watch_peers(request)
         .await
@@ -98,8 +115,12 @@ async fn watch_peers(client: &mut NodeServicesClient<Channel>, rune: &str) -> Re
     Ok(())
 }
 
-async fn watch_system(client: &mut NodeServicesClient<Channel>, rune: &str) -> Result<()> {
-    let request = with_rune(rune)?;
+async fn watch_system(
+    client: &mut NodeServicesClient<Channel>,
+    rune: &str,
+    client_id: &str,
+) -> Result<()> {
+    let request = with_auth(rune, client_id)?;
     let mut stream = client
         .watch_system(request)
         .await

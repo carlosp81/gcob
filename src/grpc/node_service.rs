@@ -7,8 +7,6 @@ use crate::cln::cln_api;
 use crate::cln::cln_api::node_services_server::NodeServices;
 use crate::domain::info::getinfo::get_info;
 use crate::domain::invoice::{create, xpay};
-use crate::grpc::interceptors::auth::{extract_client_id, CLIENT_ID_HEADER};
-use crate::grpc::interceptors::rate_limiter::check_rate_limit_with_fallback;
 
 use super::server::ApiService;
 
@@ -24,24 +22,7 @@ impl NodeServices for ApiService {
         &self,
         request: Request<cln_api::InvoiceRequest>,
     ) -> Result<Response<cln_api::InvoiceResponse>, Status> {
-        // Rate limiting (rune already validated by AuthLayer)
-        let client_id = extract_client_id(&request).ok_or_else(|| {
-            Status::invalid_argument(format!("Missing or invalid '{}' header", CLIENT_ID_HEADER))
-        })?;
-
-        let allowed = check_rate_limit_with_fallback(
-            &self.redis_cm,
-            &self.in_memory_limiter,
-            &client_id,
-        )
-        .await;
-
-        if !allowed {
-            return Err(Status::resource_exhausted(
-                "Rate limit exceeded: maximum 3 invoices per hour",
-            ));
-        }
-
+        // Rune and rate limit already enforced by AuthLayer/RateLimitLayer.
         create::create_invoice(&self.client, request).await
     }
 
@@ -71,21 +52,7 @@ impl NodeServices for ApiService {
         &self,
         request: Request<cln_api::InvoiceRequest>,
     ) -> Result<Response<Self::InvoiceStreamStream>, Status> {
-        // Rate limiting (rune already validated by AuthLayer)
-        let client_id = extract_client_id(&request).ok_or_else(|| {
-            Status::invalid_argument(format!("Missing or invalid '{}' header", CLIENT_ID_HEADER))
-        })?;
-        let allowed = check_rate_limit_with_fallback(
-            &self.redis_cm,
-            &self.in_memory_limiter,
-            &client_id,
-        )
-        .await;
-        if !allowed {
-            return Err(Status::resource_exhausted(
-                "Rate limit exceeded: maximum 3 invoices per hour",
-            ));
-        }
+        // Rune and rate limit already enforced by AuthLayer/RateLimitLayer.
 
         // 2. Llamar CLN invoice()
         let req_label = request.get_ref().label.clone();
@@ -209,7 +176,8 @@ impl NodeServices for ApiService {
         // 3. Calcular payment_hash = SHA256(preimage)
         use sha2::{Digest, Sha256};
         let preimage_bytes = hex::decode(&cln_res.payment_preimage).map_err(|e| {
-            Status::internal(format!("Failed to decode payment_preimage: {}", e))
+            tracing::error!(error = %e, "Invalid payment_preimage from CLN");
+            Status::internal("Internal error")
         })?;
         let payment_hash = {
             let mut hasher = Sha256::new();

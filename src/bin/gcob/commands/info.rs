@@ -3,11 +3,12 @@ use tonic::transport::Channel;
 
 use super::{insert_header, sanitize};
 
-pub async fn run(channel: Channel, rune: &str) -> Result<()> {
+pub async fn run(channel: Channel, rune: &str, client_id: &str) -> Result<()> {
     let mut client = gcob::cln::cln_api::node_services_client::NodeServicesClient::new(channel);
 
     let mut request = tonic::Request::new(gcob::cln::cln_api::GetinfoRequest {});
     insert_header(request.metadata_mut(), "x-rune", rune)?;
+    insert_header(request.metadata_mut(), "x-client-id", client_id)?;
 
     let response = client.getinfo(request).await?.into_inner();
 

@@ -5,6 +5,5 @@ pub mod config;
 pub mod domain;
 pub mod events;
 pub mod grpc;
-pub mod infra;
 pub mod init_common;
 pub mod role;

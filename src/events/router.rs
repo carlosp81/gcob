@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -10,7 +8,6 @@ use super::types::Event;
 pub type SubscriberId = String;
 
 struct Subscriber {
-    #[allow(dead_code)]
     id: SubscriberId,
     sender: mpsc::Sender<Event>,
 }

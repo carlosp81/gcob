@@ -11,13 +11,12 @@ use crate::cln::cln_api::node_services_server::NodeServicesServer;
 use crate::events::router::EventRouter;
 use crate::events::subscribers::ClnEventBridge;
 use crate::grpc::interceptors::auth_layer::AuthLayer;
+use crate::grpc::interceptors::rate_limit_layer::RateLimitLayer;
 use crate::grpc::interceptors::rate_limiter::InMemoryRateLimiter;
 
 pub struct ApiService {
     pub client: Arc<ClnClient>,
-    pub redis_cm: Option<redis::aio::MultiplexedConnection>,
     pub event_router: Arc<EventRouter>,
-    pub in_memory_limiter: Arc<InMemoryRateLimiter>,
 }
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -62,7 +61,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Event bridge started");
 
     // --- In-memory rate limiter fallback ---
-    let in_memory_limiter = InMemoryRateLimiter::new(3, Duration::from_secs(3600));
+    let in_memory_limiter = InMemoryRateLimiter::new();
     let limiter_clone = in_memory_limiter.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(300));
@@ -74,17 +73,18 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
     let api_service = ApiService {
         client: Arc::new(client),
-        redis_cm,
         event_router: router,
-        in_memory_limiter,
     };
 
     tracing::info!("gRPC API server listening on {}", addr);
 
     let auth_layer = AuthLayer::new(api_service.client.clone());
+    let rate_limit_layer = RateLimitLayer::new(redis_cm, in_memory_limiter);
 
+    // Auth is the outermost layer: only authenticated requests consume quota.
     Server::builder()
         .tls_config(tls_config)?
+        .layer(rate_limit_layer)
         .layer(auth_layer)
         .add_service(NodeServicesServer::new(api_service))
         .serve_with_shutdown(addr, shutdown_signal(bridge_handle))

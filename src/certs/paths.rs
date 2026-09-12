@@ -198,12 +198,20 @@ pub fn is_server_env() -> bool {
         .map(|v| !v.is_empty())
         .unwrap_or(false);
 
-    let has_server_certs = match fs::symlink_metadata("/etc/haproxy/certs") {
+    has_grpc && haproxy_certs_dir_is_secure(Path::new("/etc/haproxy/certs"))
+}
+
+/// A HAProxy certificate directory is secure when it is a real directory (not a
+/// symlink) and no broad principal (base group, named groups or other) can
+/// write to it. Named-user ACL grants (e.g. HAProxy's service user) are
+/// accepted.
+fn haproxy_certs_dir_is_secure(dir: &Path) -> bool {
+    match fs::symlink_metadata(dir) {
         Ok(meta) if meta.is_dir() && !meta.file_type().is_symlink() => {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
-                meta.mode() & 0o022 == 0
+                effective_perms_are_owner_only(dir, meta.mode() & 0o777, 0o022)
             }
             #[cfg(not(unix))]
             {
@@ -211,9 +219,7 @@ pub fn is_server_env() -> bool {
             }
         }
         _ => false,
-    };
-
-    has_grpc && has_server_certs
+    }
 }
 
 /// Check whether the process effective UID is the `gcob` service user.
@@ -431,7 +437,7 @@ pub fn reject_symlink_components(path: &Path) -> Result<(), CertError> {
 }
 
 /// POSIX ACL access tags (`system.posix_acl_access` entries) that can grant
-/// broad write access.
+/// broad permissions.
 #[cfg(unix)]
 const ACL_TAG_GROUP_OBJ: u16 = 0x04;
 #[cfg(unix)]
@@ -439,14 +445,14 @@ const ACL_TAG_GROUP: u16 = 0x08;
 #[cfg(unix)]
 const ACL_TAG_OTHER: u16 = 0x20;
 
-/// Parse a `system.posix_acl_access` blob and report whether it grants write
-/// to a broad principal (base group, named group or other).
+/// Parse a `system.posix_acl_access` blob and report whether it grants any of
+/// `perms` to a broad principal (base group, named group or other).
 ///
-/// Named-user entries are accepted: they are explicit grants by the directory
-/// owner (for example the `gcob` service account). Returns `None` when the
-/// blob is not a valid v2 ACL.
+/// Named-user entries are accepted: they are explicit grants by the file owner
+/// (for example the `gcob` service account). Returns `None` when the blob is
+/// not a valid v2 ACL.
 #[cfg(unix)]
-fn acl_has_broad_write_from_bytes(buf: &[u8]) -> Option<bool> {
+fn acl_has_broad_perms_from_bytes(buf: &[u8], perms: u16) -> Option<bool> {
     if buf.len() < 4 || !(buf.len() - 4).is_multiple_of(8) {
         return None;
     }
@@ -459,19 +465,20 @@ fn acl_has_broad_write_from_bytes(buf: &[u8]) -> Option<bool> {
     for entry in buf[4..].chunks_exact(8) {
         let tag = u16::from_le_bytes(entry[0..2].try_into().ok()?);
         let perm = u16::from_le_bytes(entry[2..4].try_into().ok()?);
-        if perm & 0o2 != 0 && matches!(tag, ACL_TAG_GROUP_OBJ | ACL_TAG_GROUP | ACL_TAG_OTHER) {
+        if perm & perms != 0 && matches!(tag, ACL_TAG_GROUP_OBJ | ACL_TAG_GROUP | ACL_TAG_OTHER) {
             broad = true;
         }
     }
     Some(broad)
 }
 
-/// Read the access ACL of `path` and report whether it grants broad write.
+/// Read the access ACL of `path` and report whether it grants any of `perms`
+/// to a broad principal.
 ///
 /// Returns `None` when the filesystem has no access ACL or does not support
 /// xattrs, so callers can fall back to the plain mode-bit check.
 #[cfg(unix)]
-fn acl_has_broad_write(path: &Path) -> Option<bool> {
+fn acl_has_broad_perms(path: &Path, perms: u16) -> Option<bool> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
@@ -503,7 +510,21 @@ fn acl_has_broad_write(path: &Path) -> Option<bool> {
         return None;
     }
     buf.truncate(read as usize);
-    acl_has_broad_write_from_bytes(&buf)
+    acl_has_broad_perms_from_bytes(&buf, perms)
+}
+
+/// Whether the effective permissions of `path` are owner/named-user only.
+///
+/// True when `mode` has none of `perms` set, or when the group/other bits come
+/// solely from a POSIX ACL mask that enables named users. Broad ACL grants
+/// (base group, named groups or other) are always rejected, and so is missing
+/// ACL information when the mode bits are not clean.
+#[cfg(unix)]
+pub fn effective_perms_are_owner_only(path: &Path, mode: u32, perms: u32) -> bool {
+    if mode & perms == 0 {
+        return true;
+    }
+    matches!(acl_has_broad_perms(path, perms as u16), Some(false))
 }
 
 /// Create (if needed) and validate a directory for privileged certificate output.
@@ -580,7 +601,7 @@ pub fn ensure_secure_dir(
         use std::os::unix::fs::{chown, MetadataExt, PermissionsExt};
 
         let current_mode = metadata.mode() & 0o777;
-        let acl_write = acl_has_broad_write(path);
+        let acl_write = acl_has_broad_perms(path, 0o2);
         // A group/other write bit may be the POSIX ACL mask enabling a named
         // user (e.g. gcob), not real group access. Only the stat fallback and
         // ACLs that grant broad write are rejected.
@@ -790,8 +811,6 @@ pub struct ClnSourcePaths {
     pub dir: PathBuf,
     pub ca_file: PathBuf,
     pub ca_key_file: PathBuf,
-    #[allow(dead_code)]
-    pub server_key_file: PathBuf,
 }
 
 impl ClnSourcePaths {
@@ -800,14 +819,58 @@ impl ClnSourcePaths {
         Self {
             ca_file: path.join("ca.pem"),
             ca_key_file: path.join("ca-key.pem"),
-            server_key_file: path.join("server-key.pem"),
             dir: path,
         }
     }
 }
 
+/// Test helpers for attaching POSIX ACLs without shelling out to `setfacl`.
+#[cfg(all(test, unix))]
+pub(crate) mod test_support {
+    use std::path::Path;
+
+    pub(crate) const TAG_USER_OBJ: u16 = 0x01;
+    pub(crate) const TAG_USER: u16 = 0x02;
+    pub(crate) const TAG_GROUP_OBJ: u16 = 0x04;
+    pub(crate) const TAG_MASK: u16 = 0x10;
+    pub(crate) const TAG_OTHER: u16 = 0x20;
+
+    pub(crate) fn acl_blob(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(4 + entries.len() * 8);
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        for (tag, perm, id) in entries {
+            buf.extend_from_slice(&tag.to_le_bytes());
+            buf.extend_from_slice(&perm.to_le_bytes());
+            buf.extend_from_slice(&id.to_le_bytes());
+        }
+        buf
+    }
+
+    /// Attach an access ACL to `path`; returns false when the filesystem does
+    /// not support POSIX ACLs, so the test can be skipped.
+    pub(crate) fn set_access_acl(path: &Path, entries: &[(u16, u16, u32)]) -> bool {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let buf = acl_blob(entries);
+        let cpath = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let name = b"system.posix_acl_access\0";
+        let rc = unsafe {
+            libc::setxattr(
+                cpath.as_ptr(),
+                name.as_ptr().cast(),
+                buf.as_ptr().cast(),
+                buf.len(),
+                0,
+            )
+        };
+        rc == 0
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
+    use super::test_support::{acl_blob, set_access_acl};
     use super::*;
 
     const TAG_USER_OBJ: u16 = 0x01;
@@ -929,38 +992,6 @@ mod tests {
         }
     }
 
-    fn acl_blob(entries: &[(u16, u16, u32)]) -> Vec<u8> {
-        let mut buf = Vec::with_capacity(4 + entries.len() * 8);
-        buf.extend_from_slice(&2u32.to_le_bytes());
-        for (tag, perm, id) in entries {
-            buf.extend_from_slice(&tag.to_le_bytes());
-            buf.extend_from_slice(&perm.to_le_bytes());
-            buf.extend_from_slice(&id.to_le_bytes());
-        }
-        buf
-    }
-
-    /// Attach an access ACL to `path`; returns false when the filesystem does
-    /// not support POSIX ACLs, so the test can be skipped.
-    fn set_access_acl(path: &Path, entries: &[(u16, u16, u32)]) -> bool {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-
-        let buf = acl_blob(entries);
-        let cpath = CString::new(path.as_os_str().as_bytes()).unwrap();
-        let name = b"system.posix_acl_access\0";
-        let rc = unsafe {
-            libc::setxattr(
-                cpath.as_ptr(),
-                name.as_ptr().cast(),
-                buf.as_ptr().cast(),
-                buf.len(),
-                0,
-            )
-        };
-        rc == 0
-    }
-
     #[test]
     fn acl_parser_accepts_named_user_write_only() {
         let account = current_account().unwrap();
@@ -971,7 +1002,8 @@ mod tests {
             (TAG_MASK, 7, u32::MAX), // ACL mask enables the named user
             (ACL_TAG_OTHER, 0, u32::MAX),
         ]);
-        assert_eq!(acl_has_broad_write_from_bytes(&blob), Some(false));
+        assert_eq!(acl_has_broad_perms_from_bytes(&blob, 0o2), Some(false));
+        assert_eq!(acl_has_broad_perms_from_bytes(&blob, 0o7), Some(false));
     }
 
     #[test]
@@ -981,14 +1013,20 @@ mod tests {
             (ACL_TAG_GROUP_OBJ, 2, u32::MAX),
             (ACL_TAG_OTHER, 0, u32::MAX),
         ]);
-        assert_eq!(acl_has_broad_write_from_bytes(&group_write), Some(true));
+        assert_eq!(
+            acl_has_broad_perms_from_bytes(&group_write, 0o2),
+            Some(true)
+        );
 
         let other_write = acl_blob(&[
             (TAG_USER_OBJ, 7, u32::MAX),
             (ACL_TAG_GROUP_OBJ, 0, u32::MAX),
             (ACL_TAG_OTHER, 6, u32::MAX),
         ]);
-        assert_eq!(acl_has_broad_write_from_bytes(&other_write), Some(true));
+        assert_eq!(
+            acl_has_broad_perms_from_bytes(&other_write, 0o2),
+            Some(true)
+        );
 
         let named_group = acl_blob(&[
             (TAG_USER_OBJ, 7, u32::MAX),
@@ -997,15 +1035,52 @@ mod tests {
             (TAG_MASK, 7, u32::MAX),
             (ACL_TAG_OTHER, 0, u32::MAX),
         ]);
-        assert_eq!(acl_has_broad_write_from_bytes(&named_group), Some(true));
+        assert_eq!(
+            acl_has_broad_perms_from_bytes(&named_group, 0o2),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn acl_parser_detects_broad_read_and_execute() {
+        let group_read = acl_blob(&[
+            (TAG_USER_OBJ, 7, u32::MAX),
+            (ACL_TAG_GROUP_OBJ, 4, u32::MAX),
+            (ACL_TAG_OTHER, 0, u32::MAX),
+        ]);
+        assert_eq!(
+            acl_has_broad_perms_from_bytes(&group_read, 0o2),
+            Some(false)
+        );
+        assert_eq!(acl_has_broad_perms_from_bytes(&group_read, 0o7), Some(true));
+
+        let other_execute = acl_blob(&[
+            (TAG_USER_OBJ, 7, u32::MAX),
+            (ACL_TAG_GROUP_OBJ, 0, u32::MAX),
+            (ACL_TAG_OTHER, 1, u32::MAX),
+        ]);
+        assert_eq!(
+            acl_has_broad_perms_from_bytes(&other_execute, 0o4),
+            Some(false)
+        );
+        assert_eq!(
+            acl_has_broad_perms_from_bytes(&other_execute, 0o1),
+            Some(true)
+        );
     }
 
     #[test]
     fn acl_parser_rejects_invalid_blobs() {
-        assert_eq!(acl_has_broad_write_from_bytes(&[]), None);
-        assert_eq!(acl_has_broad_write_from_bytes(&[2, 0, 0, 0]), Some(false));
-        assert_eq!(acl_has_broad_write_from_bytes(&[1, 0, 0, 0]), None);
-        assert_eq!(acl_has_broad_write_from_bytes(&[2, 0, 0, 0, 1, 0]), None);
+        assert_eq!(acl_has_broad_perms_from_bytes(&[], 0o2), None);
+        assert_eq!(
+            acl_has_broad_perms_from_bytes(&[2, 0, 0, 0], 0o2),
+            Some(false)
+        );
+        assert_eq!(acl_has_broad_perms_from_bytes(&[1, 0, 0, 0], 0o2), None);
+        assert_eq!(
+            acl_has_broad_perms_from_bytes(&[2, 0, 0, 0, 1, 0], 0o2),
+            None
+        );
     }
 
     #[test]
@@ -1037,7 +1112,7 @@ mod tests {
 
         // The ACL mask survived: chmod was skipped, so named-user access was
         // not revoked.
-        assert_eq!(acl_has_broad_write(&target), Some(false));
+        assert_eq!(acl_has_broad_perms(&target, 0o2), Some(false));
         assert_eq!(
             std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
             0o770
@@ -1068,5 +1143,112 @@ mod tests {
         assert!(
             ensure_secure_dir(&target, 0o700, (account.uid, account.gid), &[account.uid]).is_err()
         );
+    }
+
+    #[test]
+    fn effective_perms_owner_only_accepts_named_user_acl() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let target = base.path().join("certs");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let account = current_account().unwrap();
+        let acl = [
+            (TAG_USER_OBJ, 7, u32::MAX),
+            (TAG_USER, 5, account.uid), // named user: r-x
+            (ACL_TAG_GROUP_OBJ, 0, u32::MAX),
+            (TAG_MASK, 5, u32::MAX), // mask r-x => stat 0750
+            (ACL_TAG_OTHER, 0, u32::MAX),
+        ];
+        if !set_access_acl(&target, &acl) {
+            return; // filesystem without POSIX ACL support
+        }
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o750);
+
+        assert!(effective_perms_are_owner_only(&target, mode, 0o077));
+        assert!(effective_perms_are_owner_only(&target, mode, 0o022));
+    }
+
+    #[test]
+    fn effective_perms_owner_only_rejects_broad_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let target = base.path().join("client-key.pem");
+        std::fs::write(&target, b"x").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+        let account = current_account().unwrap();
+        let acl = [
+            (TAG_USER_OBJ, 6, u32::MAX),
+            (TAG_USER, 4, account.uid),
+            (ACL_TAG_GROUP_OBJ, 0, u32::MAX),
+            (TAG_MASK, 4, u32::MAX),
+            (ACL_TAG_OTHER, 4, u32::MAX), // broad read
+        ];
+        if !set_access_acl(&target, &acl) {
+            return;
+        }
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
+        assert!(!effective_perms_are_owner_only(&target, mode, 0o077));
+    }
+
+    #[test]
+    fn effective_perms_owner_only_rejects_clean_mode_without_acl() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert!(!effective_perms_are_owner_only(dir.path(), mode, 0o077));
+    }
+
+    #[test]
+    fn haproxy_certs_dir_is_secure_accepts_named_user_acl() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let target = base.path().join("haproxy");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let account = current_account().unwrap();
+        let acl = [
+            (TAG_USER_OBJ, 7, u32::MAX),
+            (TAG_USER, 5, account.uid),
+            (ACL_TAG_GROUP_OBJ, 0, u32::MAX),
+            (TAG_MASK, 5, u32::MAX),
+            (ACL_TAG_OTHER, 0, u32::MAX),
+        ];
+        if !set_access_acl(&target, &acl) {
+            return;
+        }
+        assert!(haproxy_certs_dir_is_secure(&target));
+    }
+
+    #[test]
+    fn haproxy_certs_dir_is_secure_rejects_group_write() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let target = base.path().join("haproxy");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o770)).unwrap();
+
+        let account = current_account().unwrap();
+        let acl = [
+            (TAG_USER_OBJ, 7, u32::MAX),
+            (TAG_USER, 7, account.uid),
+            (ACL_TAG_GROUP_OBJ, 2, u32::MAX), // real group write
+            (TAG_MASK, 7, u32::MAX),
+            (ACL_TAG_OTHER, 0, u32::MAX),
+        ];
+        if !set_access_acl(&target, &acl) {
+            return;
+        }
+        assert!(!haproxy_certs_dir_is_secure(&target));
     }
 }

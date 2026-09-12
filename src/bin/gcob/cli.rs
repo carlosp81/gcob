@@ -15,31 +15,43 @@ const CONNECTION_ARGS: &[&str] = &["host", "port", "cert", "key", "ca", "rune", 
 )]
 pub struct Cli {
     /// gRPC server host (env: GCOD_HOST)
-    #[arg(long, env = "GCOD_HOST", default_value = "localhost", global = true)]
+    #[arg(
+        long,
+        env = "GCOD_HOST",
+        default_value = "localhost",
+        global = true,
+        hide_env_values = true
+    )]
     pub host: String,
 
     /// gRPC server port (env: GCOD_PORT)
-    #[arg(long, env = "GCOD_PORT", default_value_t = 50063, global = true)]
+    #[arg(
+        long,
+        env = "GCOD_PORT",
+        default_value_t = 50063,
+        global = true,
+        hide_env_values = true
+    )]
     pub port: u16,
 
     /// Client certificate path (env: GCOD_CERT)
-    #[arg(long, env = "GCOD_CERT", global = true)]
+    #[arg(long, env = "GCOD_CERT", global = true, hide_env_values = true)]
     pub cert: Option<String>,
 
     /// Client key path (env: GCOD_KEY)
-    #[arg(long, env = "GCOD_KEY", global = true)]
+    #[arg(long, env = "GCOD_KEY", global = true, hide_env_values = true)]
     pub key: Option<String>,
 
     /// CA certificate path (env: GCOD_CA)
-    #[arg(long, env = "GCOD_CA", global = true)]
+    #[arg(long, env = "GCOD_CA", global = true, hide_env_values = true)]
     pub ca: Option<String>,
 
     /// Rune for authentication (env: GCOD_RUNE)
-    #[arg(long, env = "GCOD_RUNE", global = true)]
+    #[arg(long, env = "GCOD_RUNE", global = true, hide_env_values = true)]
     pub rune: Option<String>,
 
     /// Client identifier for rate limiting (env: GCOD_CLIENT_ID)
-    #[arg(long, env = "GCOD_CLIENT_ID", global = true)]
+    #[arg(long, env = "GCOD_CLIENT_ID", global = true, hide_env_values = true)]
     pub client_id: Option<String>,
 
     #[command(subcommand)]
@@ -243,5 +255,29 @@ mod tests {
     fn init_rejects_legacy_client_flags() {
         assert!(parse(&["gcob-client", "init", "--client-hostname", "x"]).is_err());
         assert!(parse(&["gcob-client", "init", "--client-ip", "10.0.0.9"]).is_err());
+    }
+
+    #[test]
+    fn help_hides_env_values() {
+        // A rune/client-id loaded from the trusted env file must never be
+        // rendered in help output (leaks into terminals and logs).
+        std::env::set_var("GCOD_RUNE", "leak-canary-rune");
+        std::env::set_var("GCOD_CLIENT_ID", "leak-canary-client");
+
+        let mut command = Cli::command();
+        let root_help = command.render_help().to_string();
+        let info_help = command
+            .find_subcommand_mut("info")
+            .expect("info subcommand")
+            .render_help()
+            .to_string();
+
+        std::env::remove_var("GCOD_RUNE");
+        std::env::remove_var("GCOD_CLIENT_ID");
+
+        for help in [&root_help, &info_help] {
+            assert!(!help.contains("leak-canary"), "env value leaked: {help}");
+            assert!(help.contains("GCOD_RUNE"), "env name missing: {help}");
+        }
     }
 }
