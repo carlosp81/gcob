@@ -25,18 +25,12 @@ async fn main() -> Result<()> {
 
     match cli.command {
         // CSR generation is local-only: no rune, certificates or connection needed.
-        Commands::Init {
-            client_hostname,
-            client_ip,
-            output,
-            force,
-            no_confirm,
-        } => commands::init::run(
-            client_hostname.as_deref(),
-            client_ip.as_deref(),
+        Commands::Init { common, output } => commands::init::run(
+            common.hostname.as_deref(),
+            common.ip.as_deref(),
             output.as_deref(),
-            force,
-            no_confirm,
+            common.force,
+            common.no_confirm,
         ),
         command => {
             // `--rune` takes precedence over `GCOD_RUNE` via clap's env fallback.

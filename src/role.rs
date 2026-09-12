@@ -2,8 +2,8 @@
 //!
 //! Server-only commands (`serve`, `sign`, `certs renew`) are denied when the
 //! host is resolved to the client role, so a client machine does not expose or
-//! execute server operations. `gcob init --server` is intentionally exempt: it
-//! is the bootstrap command that creates the server environment.
+//! execute server operations. `gcob init` is intentionally exempt: it is the
+//! bootstrap command that creates the server environment.
 //!
 //! Resolution order:
 //! 1. `GCOB_ROLE=client|server` (explicit override)

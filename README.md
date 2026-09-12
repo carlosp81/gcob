@@ -36,7 +36,7 @@ cargo build --release
 
 Two binaries are built:
 
-- **`gcob`** — server administration: `init --server`, `serve`, `sign`, `certs`.
+- **`gcob`** — server administration: `init`, `serve`, `sign`, `certs`.
 - **`gcob-client`** — client hosts: `init` (CSR generation), `info`, `invoice`,
   `xpay`, `watch`.
 
@@ -48,25 +48,27 @@ Role resolution for `gcob`:
 | `client` | `serve`, `sign` and `certs renew` are denied with a clear message |
 | `server` | server commands allowed (use on hosts where auto-detection is inconclusive) |
 
-`gcob init --server` is exempt because it is the bootstrap command. Client CSR
-generation now runs locally on the client host:
+`gcob init` is exempt because it is the bootstrap command. It provisions server
+certificates and is server-only. Client CSR generation runs locally on the
+client host:
 
 ```bash
-gcob-client init --client-hostname client.example --client-ip 10.0.0.5
+gcob-client init --hostname client.example --ip 10.0.0.5
 ```
 
-`gcob init --client` still works for compatibility but is deprecated, hidden
-from `init --help`, and will be removed in a future release.
+`gcob init` and `gcob-client init` share the common options `--force`,
+`--no-confirm`, `--hostname` and `--ip`. Server-only options are exclusive to
+`gcob init`.
 
-### Server provisioning (init --server)
+### Server provisioning (gcob init)
 
 Provisions HAProxy and API certificates from the CLN CA. Requires root (or
 write access to `/etc/haproxy/certs`) and explicit flags:
 
 ```bash
-sudo gcob init --server \
+sudo gcob init \
     --cln-dir /home/lightning/.lightning/bitcoin \
-    --server-hostname node.example --server-ip 10.0.0.5
+    --hostname node.example --ip 10.0.0.5
 ```
 
 - `--cln-dir` is mandatory: it must contain `ca.pem` and `ca-key.pem`.

@@ -1,5 +1,30 @@
 # Changelog
 
+## [0.5.1] - 2026-09-11
+
+Server-only `gcob init`, shared init flags and an ACL-safe certificate
+directory check.
+
+### Added
+- Shared `gcob::init_common::CommonInitArgs`: `--force`, `--no-confirm`,
+  `--hostname` and `--ip` defined once for `gcob init` and `gcob-client init`
+- `gcob::client_init::run_cli`: single client-init UI (summary, confirmation
+  and next steps); the `gcob-client` binary delegates to it
+
+### Changed
+- `gcob init` is server-only and requires `--cln-dir`; it no longer accepts
+  `--client`/`--server` mode flags
+- `gcob-client init` is the only client CSR entry point; its flags are renamed
+  to the shared `--hostname`/`--ip`
+- `gcob init --client` removed (deprecated in 0.5.0)
+- Mode-specific `init` help is now rendered natively by clap
+
+### Fixed
+- `ensure_secure_dir` no longer rejects certificate directories hardened with a
+  POSIX ACL (e.g. named-user access for `gcob`): the ACL mask was read as group
+  write, and normalizing the mode would have reset it; the ACL is now detected
+  and preserved
+
 ## [0.5.0] - 2026-09-11
 
 Client/server role separation.

@@ -1,6 +1,6 @@
 //! Shared atomic publication of staged files.
 //!
-//! Used by `init --server`, `certs renew` and `sign`: staging happens in the
+//! Used by `gcob init`, `certs renew` and `sign`: staging happens in the
 //! destination filesystem, modes/owners are applied before publication, existing
 //! files are backed up as `<name>.bak.<epoch>` and any failure rolls the whole
 //! set back to its previous state.

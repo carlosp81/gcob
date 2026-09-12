@@ -2,6 +2,8 @@ use clap::{CommandFactory, Parser, Subcommand};
 use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 
+use gcob::init_common::CommonInitArgs;
+
 /// Global connection/auth arguments that do not apply to `init`.
 const CONNECTION_ARGS: &[&str] = &["host", "port", "cert", "key", "ca", "rune", "client_id"];
 
@@ -48,25 +50,13 @@ pub struct Cli {
 pub enum Commands {
     /// Generate a client CSR for the server to sign (no connection required)
     Init {
-        /// Hostname for the client certificate (auto-detected if not specified)
-        #[arg(long)]
-        client_hostname: Option<String>,
-
-        /// IP address for the client certificate SAN (auto-detected if not specified)
-        #[arg(long)]
-        client_ip: Option<String>,
+        /// Common init options (--force, --no-confirm, --hostname, --ip)
+        #[command(flatten)]
+        common: CommonInitArgs,
 
         /// Output directory for client.csr and client-key.pem (default: ~/.certs)
         #[arg(long)]
         output: Option<PathBuf>,
-
-        /// Overwrite an existing client.csr
-        #[arg(long)]
-        force: bool,
-
-        /// Skip confirmation prompt (for scripting)
-        #[arg(long)]
-        no_confirm: bool,
     },
 
     /// Get node information
@@ -199,9 +189,9 @@ mod tests {
         let cli = parse(&[
             "gcob-client",
             "init",
-            "--client-hostname",
+            "--hostname",
             "client.example",
-            "--client-ip",
+            "--ip",
             "10.0.0.5",
             "--output",
             "/tmp/x",
@@ -211,17 +201,11 @@ mod tests {
         .unwrap();
 
         match cli.command {
-            Commands::Init {
-                client_hostname,
-                client_ip,
-                output,
-                force,
-                no_confirm,
-            } => {
-                assert_eq!(client_hostname.as_deref(), Some("client.example"));
-                assert_eq!(client_ip.as_deref(), Some("10.0.0.5"));
+            Commands::Init { common, output } => {
+                assert_eq!(common.hostname.as_deref(), Some("client.example"));
+                assert_eq!(common.ip.as_deref(), Some("10.0.0.5"));
                 assert_eq!(output.as_deref(), Some(std::path::Path::new("/tmp/x")));
-                assert!(force && no_confirm);
+                assert!(common.force && common.no_confirm);
             }
             _ => panic!("expected init subcommand"),
         }
@@ -231,16 +215,11 @@ mod tests {
     fn init_subcommand_has_defaults() {
         let cli = parse(&["gcob-client", "init"]).unwrap();
         match cli.command {
-            Commands::Init {
-                client_hostname,
-                output,
-                force,
-                no_confirm,
-                ..
-            } => {
-                assert!(client_hostname.is_none());
+            Commands::Init { common, output } => {
+                assert!(common.hostname.is_none());
+                assert!(common.ip.is_none());
                 assert!(output.is_none());
-                assert!(!force && !no_confirm);
+                assert!(!common.force && !common.no_confirm);
             }
             _ => panic!("expected init subcommand"),
         }
@@ -250,9 +229,19 @@ mod tests {
     fn init_help_hides_connection_globals() {
         let help = render_init_help().expect("init help");
         assert!(help.contains("gcob-client init [OPTIONS]"), "{help}");
+        assert!(help.contains("--hostname"), "{help}");
+        assert!(help.contains("--ip"), "{help}");
         assert!(help.contains("--output"), "{help}");
+        assert!(help.contains("--force"), "{help}");
+        assert!(help.contains("--no-confirm"), "{help}");
         assert!(!help.contains("--rune"), "{help}");
-        assert!(!help.contains("--host"), "{help}");
+        assert!(!help.contains("--host "), "{help}");
         assert!(!help.contains("--ca "), "{help}");
+    }
+
+    #[test]
+    fn init_rejects_legacy_client_flags() {
+        assert!(parse(&["gcob-client", "init", "--client-hostname", "x"]).is_err());
+        assert!(parse(&["gcob-client", "init", "--client-ip", "10.0.0.9"]).is_err());
     }
 }

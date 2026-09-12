@@ -1,8 +1,8 @@
-//! Client-side CSR generation, shared by `gcob init --client` and
-//! `gcob-client init`.
+//! Client-side CSR generation for `gcob-client init`.
 //!
 //! Split into a pure `plan()` step (identity + output resolution, safe to print
-//! and confirm) and a `run()` step (permissions, ownership and generation).
+//! and confirm), a `run()` step (permissions, ownership and generation) and a
+//! `run_cli()` presentation layer (summary, confirmation and next steps).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -105,6 +105,88 @@ pub fn run(plan: &ClientInitPlan, force: bool, with_gcob_acls: bool) -> Result<(
     Ok(())
 }
 
+/// Full `gcob-client init` flow: resolve, confirm, generate and guide.
+///
+/// This is the single implementation of the client-init user interface; the
+/// `gcob-client` binary delegates here so there is no duplicated presentation
+/// logic. Aborting the prompt is not an error and returns `Ok(())`.
+pub fn run_cli(
+    hostname: Option<&str>,
+    ip: Option<&str>,
+    output: Option<&Path>,
+    force: bool,
+    no_confirm: bool,
+) -> Result<(), CertError> {
+    let plan = plan(hostname, ip, output)?;
+    let csr_exists = plan.cert_dir.join("client.csr").exists();
+
+    print!("{}", render_summary(&plan, force && csr_exists));
+    if !no_confirm && !confirm() {
+        println!("Aborted.");
+        return Ok(());
+    }
+
+    println!("[1/2] Generating CSR...");
+    run(&plan, force, false)?;
+    println!("[2/2] CSR generated successfully");
+    println!();
+    print!("{}", render_files(&plan));
+    print!("{}", render_next_steps(&plan));
+    Ok(())
+}
+
+/// Render the pre-confirmation summary (identity, output and overwrite mode).
+fn render_summary(plan: &ClientInitPlan, overwrite: bool) -> String {
+    let mut out = String::from("=== gcob-client CSR generation ===\n\n");
+    out.push_str(&format!("  Hostname: {}\n", plan.hostname));
+    if let Some(ref ip) = plan.ip {
+        out.push_str(&format!("  IP:       {}\n", ip));
+    }
+    out.push_str(&format!("  Output:   {}\n", plan.cert_dir.display()));
+    if overwrite {
+        out.push_str("  Mode:     Overwrite existing CSR\n");
+    }
+    out.push('\n');
+    out
+}
+
+/// Render the generated file list.
+fn render_files(plan: &ClientInitPlan) -> String {
+    format!(
+        "Files:\n  {}/client.csr      (send to server)\n  {}/client-key.pem  (keep secret)\n\n",
+        plan.cert_dir.display(),
+        plan.cert_dir.display()
+    )
+}
+
+/// Render the post-generation guidance for signing the CSR on the server.
+fn render_next_steps(plan: &ClientInitPlan) -> String {
+    format!(
+        "Next steps:\n  \
+         1. Send client.csr to the server:\n     \
+         scp {dir}/client.csr user@server:/tmp/\n\n  \
+         2. On the server, sign the CSR:\n     \
+         gcob sign --csr /tmp/client.csr --hostname {host} --cln-dir <CLN_DIR> --output <DIR>\n\n  \
+         3. Server will return: ca.pem + client.pem\n     \
+         Place them in: {dir}/\n",
+        dir = plan.cert_dir.display(),
+        host = plan.hostname,
+    )
+}
+
+/// Ask the user to confirm; returns `false` on an explicit "n"/"no".
+fn confirm() -> bool {
+    use std::io::Write;
+
+    print!("Proceed? [Y/n] ");
+    std::io::stdout().flush().ok();
+
+    let mut input = String::new();
+    std::io::stdin().read_line(&mut input).ok();
+    let input = input.trim().to_lowercase();
+    !(input == "n" || input == "no")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -126,6 +208,17 @@ mod tests {
         assert_eq!(plan.ip.as_deref(), Some("10.0.0.5"));
         assert_eq!(plan.cert_dir, dir.path());
         assert!(!plan.uses_default_dir);
+    }
+
+    #[test]
+    fn plan_without_output_uses_default_admin_dir() {
+        let plan = plan(Some("client.example"), None, None).unwrap();
+        assert!(plan.uses_default_dir);
+        assert!(
+            plan.cert_dir.ends_with(".certs"),
+            "unexpected default dir: {}",
+            plan.cert_dir.display()
+        );
     }
 
     #[test]
@@ -204,5 +297,70 @@ mod tests {
             let uid = fs::metadata(dir.path().join("client.csr")).unwrap().uid();
             assert_eq!(uid, account.uid);
         }
+    }
+
+    #[test]
+    fn render_summary_includes_identity_output_and_mode() {
+        let dir = temp_dir();
+        let plan = test_plan(dir.path());
+
+        let plain = render_summary(&plan, false);
+        assert!(
+            plain.contains("=== gcob-client CSR generation ==="),
+            "{plain}"
+        );
+        assert!(plain.contains("client.example"), "{plain}");
+        assert!(plain.contains("10.0.0.5"), "{plain}");
+        assert!(plain.contains(&dir.path().display().to_string()), "{plain}");
+        assert!(!plain.contains("Overwrite"), "{plain}");
+
+        let overwrite = render_summary(&plan, true);
+        assert!(
+            overwrite.contains("Mode:     Overwrite existing CSR"),
+            "{overwrite}"
+        );
+    }
+
+    #[test]
+    fn render_files_lists_csr_and_key() {
+        let dir = temp_dir();
+        let plan = test_plan(dir.path());
+        let files = render_files(&plan);
+        assert!(files.contains("client.csr"), "{files}");
+        assert!(files.contains("client-key.pem"), "{files}");
+        assert!(files.contains("send to server"), "{files}");
+    }
+
+    #[test]
+    fn render_next_steps_points_to_server_signing() {
+        let dir = temp_dir();
+        let plan = test_plan(dir.path());
+        let steps = render_next_steps(&plan);
+        assert!(steps.contains("--cln-dir <CLN_DIR>"), "{steps}");
+        assert!(steps.contains("--output <DIR>"), "{steps}");
+        assert!(steps.contains("--hostname client.example"), "{steps}");
+        assert!(steps.contains("ca.pem + client.pem"), "{steps}");
+    }
+
+    #[test]
+    fn run_cli_generates_csr_in_output_dir() {
+        let dir = temp_dir();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+
+        run_cli(
+            Some("client.example"),
+            Some("10.0.0.5"),
+            Some(dir.path()),
+            false,
+            true,
+        )
+        .unwrap();
+
+        assert!(dir.path().join("client.csr").exists());
+        assert!(dir.path().join("client-key.pem").exists());
     }
 }
