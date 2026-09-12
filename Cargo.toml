@@ -23,7 +23,6 @@ anyhow = "1.0.100"
 tracing = "0.1.43"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio-rustls = "0.26.4"
-rustls-pemfile = "2.2.0"
 hyper-util = "0.1.17"
 http = "1.4.0"
 http-body = "1.0"

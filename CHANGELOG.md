@@ -24,6 +24,10 @@
 - Server and CLN-client certificate material is read with `O_NOFOLLOW` and
   validated through the opened descriptor (`fstat`/`fgetxattr`), so a symlink
   or a check-then-read swap cannot redirect the read (GCOB-009)
+- `h2` upgraded to 0.4.19 (RUSTSEC-2026-0258: unbounded empty DATA frames),
+  `anyhow` to 1.0.104 (RUSTSEC-2026-0190) and `event-listener` to 5.4.2
+  (RUSTSEC-2026-0221); removed the unused `rustls-pemfile` dependency
+  (RUSTSEC-2025-0134, unmaintained)
 
 ## [0.5.3] - 2026-09-12
 
@@ -47,6 +51,9 @@ pre-auth budget and bounded request bodies.
   remote address, path and latency
 - CI workflow (fmt, clippy `-D warnings`, tests) and
   `security/availability-baseline.md`
+- `deny.toml` and a `supply-chain` CI job (`cargo-deny`: advisories, licenses,
+  bans, sources) plus weekly Dependabot updates for Cargo and GitHub Actions
+  (GCOB-010)
 
 ### Changed
 - Per-method rate limiting is keyed by certificate fingerprint instead of the
