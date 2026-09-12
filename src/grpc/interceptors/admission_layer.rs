@@ -236,6 +236,40 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
     }
 
+    /// Bounded adversarial load: 10 000 requests rotating 10 certificates and
+    /// 10 000 distinct `x-client-id` claims must consume exactly the per
+    /// certificate budget and grow the limiter state by at most 10 buckets.
+    #[tokio::test]
+    async fn bounded_load_with_spoofed_claims_stays_bounded() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let inner = CountingService {
+            calls: calls.clone(),
+        };
+        let fallback = InMemoryRateLimiter::new();
+        let mut service =
+            AdmissionLayer::new(None, fallback.clone(), &limits_with_budget(100)).layer(inner);
+
+        let mut admitted = 0usize;
+        for i in 0..10_000 {
+            let fingerprint = format!("cert-{:02}", i % 10);
+            let mut req = request(Some(fingerprint.as_str()));
+            req.headers_mut()
+                .insert("x-client-id", format!("claim-{i}").parse().unwrap());
+            let response = service.call(req).await.unwrap();
+            if response.headers().get("grpc-status").is_none() {
+                admitted += 1;
+            }
+        }
+
+        assert_eq!(admitted, 1_000, "10 certificates x 100 budget");
+        assert_eq!(calls.load(Ordering::SeqCst), 1_000);
+        assert_eq!(
+            fallback.bucket_count().await,
+            10,
+            "spoofed claims must not create additional buckets"
+        );
+    }
+
     /// GCOB-003 regression: after the pre-auth budget is exhausted, invalid
     /// runes never reach the inner (auth) service, hence never reach CLN.
     #[tokio::test]

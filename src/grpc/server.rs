@@ -97,9 +97,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let rate_limit_layer = RateLimitLayer::new(redis_cm, in_memory_limiter);
     let max_decoding_message_size = limits.max_request_body_bytes;
 
-    // Layer order (outermost first): identity -> admission -> auth -> rate
-    // limit -> service. The pre-auth budget is consumed before any CLN
-    // interaction; only authenticated requests consume method quota.
+    // tower calls the layer added FIRST first (first added = outermost):
+    // identity -> admission -> auth -> rate limit -> service. The pre-auth
+    // budget is consumed before any CLN interaction; only authenticated
+    // requests consume method quota.
     //
     // Transport limits bound per-connection resources independently of the
     // application budgets; keepalive detects dead peers on idle streams.
@@ -111,10 +112,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .http2_keepalive_interval(Some(Duration::from_secs(30)))
         .http2_keepalive_timeout(Some(Duration::from_secs(10)))
         .http2_max_pending_accept_reset_streams(Some(limits.concurrency_limit_per_connection))
-        .layer(rate_limit_layer)
-        .layer(auth_layer)
-        .layer(admission_layer)
         .layer(ClientIdentityLayer::new())
+        .layer(admission_layer)
+        .layer(auth_layer)
+        .layer(rate_limit_layer)
         .add_service(
             NodeServicesServer::new(api_service)
                 .max_decoding_message_size(max_decoding_message_size),

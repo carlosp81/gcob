@@ -159,6 +159,13 @@ impl InMemoryRateLimiter {
             now.duration_since(bucket.last_refill) < bucket.refill_duration * 2
         });
     }
+
+    /// Number of tracked keys; used by availability tests to assert that
+    /// spoofed claims cannot grow the limiter state.
+    #[cfg(test)]
+    pub(crate) async fn bucket_count(&self) -> usize {
+        self.buckets.lock().await.len()
+    }
 }
 
 // --- Combined rate limiter with fallback ---
