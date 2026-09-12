@@ -1431,4 +1431,109 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(read_secure_file(&path, false).is_ok());
     }
+
+    // --- reject_symlink_components ---
+
+    #[test]
+    fn reject_symlink_components_accepts_regular_absolute_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("ca.pem");
+        std::fs::write(&file, b"ca").unwrap();
+        assert!(reject_symlink_components(&file).is_ok());
+    }
+
+    #[test]
+    fn reject_symlink_components_rejects_relative_path() {
+        let err = reject_symlink_components(Path::new("certs/ca.pem")).unwrap_err();
+        assert!(format!("{err}").contains("absolute"), "{err}");
+    }
+
+    #[test]
+    fn reject_symlink_components_rejects_parent_dir() {
+        let err = reject_symlink_components(Path::new("/etc/../etc/ca.pem")).unwrap_err();
+        assert!(format!("{err}").contains("unsupported component"), "{err}");
+    }
+
+    #[test]
+    fn reject_symlink_components_rejects_intermediate_symlink() {
+        let base = tempfile::tempdir().unwrap();
+        let real = base.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = base.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let err = reject_symlink_components(&link.join("ca.pem")).unwrap_err();
+        assert!(format!("{err}").contains("symlink"), "{err}");
+    }
+
+    #[test]
+    fn reject_symlink_components_accepts_nonexistent_tail() {
+        let base = tempfile::tempdir().unwrap();
+        assert!(reject_symlink_components(&base.path().join("a/b/ca.pem")).is_ok());
+    }
+
+    // --- validate_cln_source ---
+
+    fn cln_source_fixture(dir_mode: u32, key_mode: u32) -> (tempfile::TempDir, ClnSourcePaths) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let dir = base.path().join("cln");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("ca.pem"), b"ca").unwrap();
+        std::fs::write(dir.join("ca-key.pem"), b"key").unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(dir_mode)).unwrap();
+        std::fs::set_permissions(
+            dir.join("ca-key.pem"),
+            std::fs::Permissions::from_mode(key_mode),
+        )
+        .unwrap();
+
+        let source = ClnSourcePaths::new(&dir);
+        (base, source)
+    }
+
+    #[test]
+    fn validate_cln_source_accepts_secure_layout() {
+        let (_base, source) = cln_source_fixture(0o700, 0o400);
+        assert!(validate_cln_source(&source).is_ok());
+    }
+
+    #[test]
+    fn validate_cln_source_rejects_group_writable_dir() {
+        let (_base, source) = cln_source_fixture(0o770, 0o400);
+        let err = validate_cln_source(&source).unwrap_err();
+        assert!(format!("{err}").contains("group/other writable"), "{err}");
+    }
+
+    #[test]
+    fn validate_cln_source_rejects_loose_ca_key() {
+        let (_base, source) = cln_source_fixture(0o700, 0o644);
+        let err = validate_cln_source(&source).unwrap_err();
+        assert!(format!("{err}").contains("0600 or 0400"), "{err}");
+    }
+
+    #[test]
+    fn validate_cln_source_rejects_symlinked_ca() {
+        let (base, source) = cln_source_fixture(0o700, 0o400);
+        let real = base.path().join("real-ca.pem");
+        std::fs::write(&real, b"ca").unwrap();
+        std::fs::remove_file(&source.ca_file).unwrap();
+        std::os::unix::fs::symlink(&real, &source.ca_file).unwrap();
+
+        let err = validate_cln_source(&source).unwrap_err();
+        assert!(format!("{err}").contains("symlink"), "{err}");
+    }
+
+    #[test]
+    fn validate_cln_source_rejects_symlinked_ca_key() {
+        let (base, source) = cln_source_fixture(0o700, 0o400);
+        let real = base.path().join("real-ca-key.pem");
+        std::fs::write(&real, b"key").unwrap();
+        std::fs::remove_file(&source.ca_key_file).unwrap();
+        std::os::unix::fs::symlink(&real, &source.ca_key_file).unwrap();
+
+        let err = validate_cln_source(&source).unwrap_err();
+        assert!(format!("{err}").contains("symlink"), "{err}");
+    }
 }
