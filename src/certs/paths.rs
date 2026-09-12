@@ -779,6 +779,99 @@ pub fn validate_cert_dir_target(path: &Path) -> Result<(), CertError> {
     Ok(())
 }
 
+/// Read a certificate file without following symlinks and validate the opened
+/// descriptor before reading.
+///
+/// `O_NOFOLLOW` makes the open itself fail on a symlinked final component and
+/// the subsequent metadata/ACL checks run on the same descriptor that is read,
+/// closing the check-then-read (TOCTOU) window of a plain `fs::read`. When
+/// `is_private_key` is true the descriptor must be owner-only (0600/0400 or a
+/// named-user ACL grant).
+pub fn read_secure_file(path: &Path, is_private_key: bool) -> Result<Vec<u8>, CertError> {
+    use std::io::Read;
+
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
+    }
+
+    let mut file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) => {
+            #[cfg(unix)]
+            if e.raw_os_error() == Some(libc::ELOOP) {
+                return Err(CertError::Io(std::io::Error::other(format!(
+                    "Refusing to read symlinked certificate file: {}",
+                    path.display()
+                ))));
+            }
+            return Err(CertError::Io(e));
+        }
+    };
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(CertError::Io(std::io::Error::other(format!(
+            "Certificate path is not a regular file: {}",
+            path.display()
+        ))));
+    }
+
+    #[cfg(unix)]
+    if is_private_key {
+        use std::os::unix::fs::MetadataExt;
+
+        let mode = metadata.mode() & 0o777;
+        if !effective_perms_are_owner_only_fd(&file, mode, 0o077) {
+            return Err(CertError::Io(std::io::Error::other(format!(
+                "Private key {} is readable by group/other; expected 0600 or 0400",
+                path.display()
+            ))));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = is_private_key;
+
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+    Ok(buf)
+}
+
+/// Like [`effective_perms_are_owner_only`] but inspects the descriptor, so a
+/// path swap cannot redirect the ACL lookup.
+#[cfg(unix)]
+fn effective_perms_are_owner_only_fd(file: &fs::File, mode: u32, perms: u32) -> bool {
+    if mode & perms == 0 {
+        return true;
+    }
+    matches!(acl_has_broad_perms_fd(file, perms as u16), Some(false))
+}
+
+#[cfg(unix)]
+fn acl_has_broad_perms_fd(file: &fs::File, perms: u16) -> Option<bool> {
+    use std::os::unix::io::AsRawFd;
+
+    let fd = file.as_raw_fd();
+    let name = b"system.posix_acl_access\0";
+
+    let size = unsafe { libc::fgetxattr(fd, name.as_ptr().cast(), std::ptr::null_mut(), 0) };
+    if size <= 0 {
+        return None;
+    }
+
+    let mut buf = vec![0u8; size as usize];
+    let read =
+        unsafe { libc::fgetxattr(fd, name.as_ptr().cast(), buf.as_mut_ptr().cast(), buf.len()) };
+    if read < 0 {
+        return None;
+    }
+    buf.truncate(read as usize);
+    acl_has_broad_perms_from_bytes(&buf, perms)
+}
+
 /// Server certificate paths (for HAProxy mTLS)
 pub struct ServerPaths {
     pub haproxy_cert_dir: PathBuf,
@@ -1250,5 +1343,92 @@ mod tests {
             return;
         }
         assert!(!haproxy_certs_dir_is_secure(&target));
+    }
+
+    // --- read_secure_file (TOCTOU-safe certificate reads) ---
+
+    #[test]
+    fn read_secure_file_reads_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.pem");
+        std::fs::write(&path, b"certificate").unwrap();
+        assert_eq!(read_secure_file(&path, false).unwrap(), b"certificate");
+    }
+
+    #[test]
+    fn read_secure_file_rejects_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real.pem");
+        std::fs::write(&real, b"secret").unwrap();
+        let link = dir.path().join("client-key.pem");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let err = read_secure_file(&link, true).unwrap_err();
+        assert!(format!("{err}").contains("symlink"), "{err}");
+    }
+
+    #[test]
+    fn read_secure_file_rejects_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = read_secure_file(dir.path(), false).unwrap_err();
+        assert!(format!("{err}").contains("regular file"), "{err}");
+    }
+
+    #[test]
+    fn read_secure_file_rejects_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_secure_file(&dir.path().join("missing.pem"), false).is_err());
+    }
+
+    #[test]
+    fn read_secure_file_private_key_requires_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client-key.pem");
+        std::fs::write(&path, b"key").unwrap();
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_secure_file(&path, true).is_err());
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(read_secure_file(&path, true).is_ok());
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        assert!(read_secure_file(&path, true).is_ok());
+    }
+
+    #[test]
+    fn read_secure_file_private_key_accepts_named_user_acl() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client-key.pem");
+        std::fs::write(&path, b"key").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+
+        let account = current_account().unwrap();
+        let acl = [
+            (TAG_USER_OBJ, 6, u32::MAX),
+            (TAG_USER, 4, account.uid), // named user: r--
+            (ACL_TAG_GROUP_OBJ, 0, u32::MAX),
+            (TAG_MASK, 4, u32::MAX), // stat now reports 0440
+            (ACL_TAG_OTHER, 0, u32::MAX),
+        ];
+        if !set_access_acl(&path, &acl) {
+            return; // filesystem without POSIX ACL support
+        }
+        assert!(read_secure_file(&path, true).is_ok());
+    }
+
+    #[test]
+    fn read_secure_file_accepts_public_cert_with_broad_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.pem");
+        std::fs::write(&path, b"ca").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(read_secure_file(&path, false).is_ok());
     }
 }

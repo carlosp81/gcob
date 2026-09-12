@@ -1,4 +1,3 @@
-use std::fs;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -6,6 +5,7 @@ use redis::Client;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 
 use crate::certs::mtls_certs::ClnConfig;
+use crate::certs::paths::read_secure_file;
 use crate::cln::client::ClnClient;
 use crate::cln::cln_api::node_services_server::NodeServicesServer;
 use crate::events::router::{EventRouter, RouterLimits};
@@ -50,9 +50,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let server_cert = fs::read(&cert_config.server_file)?;
-    let server_key = fs::read(&cert_config.server_key_file)?;
-    let ca_cert = fs::read(&cert_config.ca_file)?;
+    let server_cert = read_secure_file(&cert_config.server_file, false)?;
+    let server_key = read_secure_file(&cert_config.server_key_file, true)?;
+    let ca_cert = read_secure_file(&cert_config.ca_file, false)?;
 
     let tls_config = ServerTlsConfig::new()
         .identity(Identity::from_pem(server_cert, server_key))

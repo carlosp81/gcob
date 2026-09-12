@@ -20,6 +20,11 @@
   subscribers are unsubscribed after `GCOB_SLOW_SUBSCRIBER_MAX_DROPS`
   consecutive drops (GCOB-005/006)
 
+### Fixed
+- Server and CLN-client certificate material is read with `O_NOFOLLOW` and
+  validated through the opened descriptor (`fstat`/`fgetxattr`), so a symlink
+  or a check-then-read swap cannot redirect the read (GCOB-009)
+
 ## [0.5.3] - 2026-09-12
 
 Admission control hardened: certificate-bound rate limiting, a cheap

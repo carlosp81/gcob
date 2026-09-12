@@ -1,5 +1,3 @@
-use std::fs;
-
 use anyhow::{Context, Result};
 
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
@@ -20,16 +18,18 @@ use crate::certs::mtls_certs::ClnConfig;
 impl ClnClient {
     /// Conecta al nodo CLN mediante mTLS a través de HAProxy.
     pub async fn connect(config: &ClnConfig) -> Result<Self> {
-        // 1. Leer los certificados del sistema de archivos
-        let ca_pem = fs::read(&config.ca_file)
+        // 1. Leer los certificados del sistema de archivos sin seguir symlinks
+        let ca_pem = crate::certs::paths::read_secure_file(&config.ca_file, false)
             .with_context(|| format!("Failed to read CA certificate from {:#?}", config.ca_file))?;
-        let client_cert_pem = fs::read(&config.client_file).with_context(|| {
-            format!(
-                "Failed to read client certificate from {:#?}",
-                config.client_file
-            )
-        })?;
-        let client_key_pem = fs::read(&config.client_key_file).with_context(|| {
+        let client_cert_pem = crate::certs::paths::read_secure_file(&config.client_file, false)
+            .with_context(|| {
+                format!(
+                    "Failed to read client certificate from {:#?}",
+                    config.client_file
+                )
+            })?;
+        let client_key_pem = crate::certs::paths::read_secure_file(&config.client_key_file, true)
+            .with_context(|| {
             format!(
                 "Failed to read client key from {:#?}",
                 config.client_key_file
