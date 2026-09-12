@@ -1,6 +1,8 @@
 # Changelog
 
-## [Unreleased]
+## [0.5.2] - 2026-09-11
+
+Per-method rate limiting, ACL-aware certificate validation and error hardening.
 
 ### Added
 - `RateLimitLayer` (tower, HTTP layer) with independent per-method budgets:
