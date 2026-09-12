@@ -21,6 +21,11 @@
   consecutive drops (GCOB-005/006)
 
 ### Fixed
+- Layer order was inverted: tower calls the layer added first first, so
+  `RateLimitLayer` ran before `ClientIdentityLayer` and rejected every request
+  with `Client certificate required`. The stack is now
+  identity → admission → auth → rate limit (GCOB-011), covered by the new
+  mTLS end-to-end tests
 - Server and CLN-client certificate material is read with `O_NOFOLLOW` and
   validated through the opened descriptor (`fstat`/`fgetxattr`), so a symlink
   or a check-then-read swap cannot redirect the read (GCOB-009)
@@ -54,6 +59,10 @@ pre-auth budget and bounded request bodies.
 - `deny.toml` and a `supply-chain` CI job (`cargo-deny`: advisories, licenses,
   bans, sources) plus weekly Dependabot updates for Cargo and GitHub Actions
   (GCOB-010)
+- End-to-end mTLS tests (`src/grpc/e2e_tests.rs`) that run the real
+  identity/admission/auth/rate-limit stack behind a tonic server with an
+  ephemeral `rcgen` PKI, plus bounded-load coverage; `security/findings.md`
+  and `security/availability-invariants.md`
 
 ### Changed
 - Per-method rate limiting is keyed by certificate fingerprint instead of the
