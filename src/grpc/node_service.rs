@@ -7,6 +7,9 @@ use crate::cln::cln_api;
 use crate::cln::cln_api::node_services_server::NodeServices;
 use crate::domain::info::getinfo::get_info;
 use crate::domain::invoice::{create, xpay};
+use crate::events::router::SubscribeError;
+use crate::grpc::interceptors::identity::ClientIdentity;
+use crate::grpc::stream_limits::{next_event_or_cancel, StreamPermit};
 
 use super::server::ApiService;
 
@@ -14,6 +17,27 @@ static SUBSCRIBER_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 fn next_subscriber_id() -> String {
     format!("sub-{}", SUBSCRIBER_COUNTER.fetch_add(1, Ordering::Relaxed))
+}
+
+fn subscribe_status(err: SubscribeError) -> Status {
+    Status::resource_exhausted(match err {
+        SubscribeError::GlobalLimit => "Too many active subscribers (global limit reached)",
+        SubscribeError::TypeLimit => "Too many active subscribers for this event type",
+    })
+}
+
+impl ApiService {
+    /// Reserve a concurrent-stream slot for the calling client certificate.
+    ///
+    /// Called before any backend side effect (invoice creation, payment) so an
+    /// over-limit request has no effect beyond the rejection.
+    fn acquire_stream<T>(&self, request: &Request<T>) -> Result<StreamPermit, Status> {
+        let identity = request
+            .extensions()
+            .get::<ClientIdentity>()
+            .ok_or_else(|| Status::unauthenticated("Client certificate required"))?;
+        self.stream_limits.acquire(&identity.fingerprint_sha256)
+    }
 }
 
 #[tonic::async_trait]
@@ -53,6 +77,7 @@ impl NodeServices for ApiService {
         request: Request<cln_api::InvoiceRequest>,
     ) -> Result<Response<Self::InvoiceStreamStream>, Status> {
         // Rune and rate limit already enforced by AuthLayer/RateLimitLayer.
+        let permit = self.acquire_stream(&request)?;
 
         // 2. Llamar CLN invoice()
         let req_label = request.get_ref().label.clone();
@@ -112,13 +137,15 @@ impl NodeServices for ApiService {
         let subscriber_id = next_subscriber_id();
         router
             .subscribe("invoice", subscriber_id.clone(), internal_tx)
-            .await;
+            .await
+            .map_err(subscribe_status)?;
 
         // 5. Spawn task con filtro por label
         let router_clone = router.clone();
         let sub_id = subscriber_id.clone();
         let target_label = req_label.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             tracing::info!(
                 subscriber_id = %sub_id,
                 label = %target_label,
@@ -133,7 +160,7 @@ impl NodeServices for ApiService {
             }
 
             // Filtrar InvoicePaid por label
-            while let Some(event) = internal_rx.recv().await {
+            while let Some(event) = next_event_or_cancel(&mut internal_rx, &proto_tx).await {
                 if let crate::events::types::Event::Invoice(
                     crate::events::types::InvoiceEvent::Paid { label, .. },
                 ) = &event
@@ -168,6 +195,7 @@ impl NodeServices for ApiService {
         request: Request<cln_api::XpayRequest>,
     ) -> Result<Response<Self::XpayStreamWatchStream>, Status> {
         // Rune already validated by AuthLayer
+        let permit = self.acquire_stream(&request)?;
 
         // 2. Llamar CLN xpay()
         let cln_response = xpay::xpay(&self.client, request).await?;
@@ -194,13 +222,15 @@ impl NodeServices for ApiService {
         let subscriber_id = next_subscriber_id();
         router
             .subscribe("payment", subscriber_id.clone(), internal_tx)
-            .await;
+            .await
+            .map_err(subscribe_status)?;
 
         // 5. Spawn task con filtro por payment_hash
         let router_clone = router.clone();
         let sub_id = subscriber_id.clone();
         let target_hash = payment_hash.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             tracing::info!(
                 subscriber_id = %sub_id,
                 payment_hash = %target_hash,
@@ -208,7 +238,7 @@ impl NodeServices for ApiService {
             );
 
             // Filtrar PaymentSucceeded o PaymentFailed por payment_hash
-            while let Some(event) = internal_rx.recv().await {
+            while let Some(event) = next_event_or_cancel(&mut internal_rx, &proto_tx).await {
                 let matches = match &event {
                     crate::events::types::Event::Payment(
                         crate::events::types::PaymentEvent::Succeeded { payment_hash, .. },
@@ -247,9 +277,10 @@ impl NodeServices for ApiService {
 
     async fn xpay_stream(
         &self,
-        _request: Request<()>,
+        request: Request<()>,
     ) -> Result<Response<Self::XpayStreamStream>, Status> {
         // Rune already validated by AuthLayer
+        let permit = self.acquire_stream(&request)?;
 
         let (internal_tx, mut internal_rx) =
             tokio::sync::mpsc::channel::<crate::events::types::Event>(64);
@@ -260,13 +291,15 @@ impl NodeServices for ApiService {
 
         router
             .subscribe("payment", subscriber_id.clone(), internal_tx)
-            .await;
+            .await
+            .map_err(subscribe_status)?;
 
         let router_clone = router.clone();
         let sub_id = subscriber_id.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             tracing::info!(subscriber_id = %sub_id, "xpay_stream subscribed");
-            while let Some(event) = internal_rx.recv().await {
+            while let Some(event) = next_event_or_cancel(&mut internal_rx, &proto_tx).await {
                 tracing::debug!(subscriber_id = %sub_id, "payment event received");
                 if let Some(proto_event) =
                     crate::domain::invoice::pay_stream::to_proto_event(&event)
@@ -288,9 +321,10 @@ impl NodeServices for ApiService {
 
     async fn invoice_watch(
         &self,
-        _request: Request<()>,
+        request: Request<()>,
     ) -> Result<Response<Self::InvoiceWatchStream>, Status> {
         // Rune already validated by AuthLayer
+        let permit = self.acquire_stream(&request)?;
 
         let (internal_tx, mut internal_rx) =
             tokio::sync::mpsc::channel::<crate::events::types::Event>(64);
@@ -301,13 +335,15 @@ impl NodeServices for ApiService {
 
         router
             .subscribe("invoice", subscriber_id.clone(), internal_tx)
-            .await;
+            .await
+            .map_err(subscribe_status)?;
 
         let router_clone = router.clone();
         let sub_id = subscriber_id.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             tracing::info!(subscriber_id = %sub_id, "invoice_watch subscribed");
-            while let Some(event) = internal_rx.recv().await {
+            while let Some(event) = next_event_or_cancel(&mut internal_rx, &proto_tx).await {
                 tracing::debug!(subscriber_id = %sub_id, "invoice event received");
                 if let Some(proto_event) = crate::domain::invoice::watch::to_proto_event(&event) {
                     if proto_tx.send(Ok(proto_event)).await.is_err() {
@@ -327,9 +363,10 @@ impl NodeServices for ApiService {
 
     async fn watch_channels(
         &self,
-        _request: Request<()>,
+        request: Request<()>,
     ) -> Result<Response<Self::WatchChannelsStream>, Status> {
         // Rune already validated by AuthLayer
+        let permit = self.acquire_stream(&request)?;
 
         let (internal_tx, mut internal_rx) =
             tokio::sync::mpsc::channel::<crate::events::types::Event>(64);
@@ -340,13 +377,15 @@ impl NodeServices for ApiService {
 
         router
             .subscribe("channel", subscriber_id.clone(), internal_tx)
-            .await;
+            .await
+            .map_err(subscribe_status)?;
 
         let router_clone = router.clone();
         let sub_id = subscriber_id.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             tracing::info!(subscriber_id = %sub_id, "watch_channels subscribed");
-            while let Some(event) = internal_rx.recv().await {
+            while let Some(event) = next_event_or_cancel(&mut internal_rx, &proto_tx).await {
                 tracing::debug!(subscriber_id = %sub_id, "channel event received");
                 if let Some(proto_event) = crate::domain::channel::events::to_proto_event(&event) {
                     if proto_tx.send(Ok(proto_event)).await.is_err() {
@@ -366,9 +405,10 @@ impl NodeServices for ApiService {
 
     async fn watch_peers(
         &self,
-        _request: Request<()>,
+        request: Request<()>,
     ) -> Result<Response<Self::WatchPeersStream>, Status> {
         // Rune already validated by AuthLayer
+        let permit = self.acquire_stream(&request)?;
 
         let (internal_tx, mut internal_rx) =
             tokio::sync::mpsc::channel::<crate::events::types::Event>(64);
@@ -379,13 +419,15 @@ impl NodeServices for ApiService {
 
         router
             .subscribe("peer", subscriber_id.clone(), internal_tx)
-            .await;
+            .await
+            .map_err(subscribe_status)?;
 
         let router_clone = router.clone();
         let sub_id = subscriber_id.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             tracing::info!(subscriber_id = %sub_id, "watch_peers subscribed");
-            while let Some(event) = internal_rx.recv().await {
+            while let Some(event) = next_event_or_cancel(&mut internal_rx, &proto_tx).await {
                 tracing::debug!(subscriber_id = %sub_id, "peer event received");
                 if let Some(proto_event) = crate::domain::peer::events::to_proto_event(&event) {
                     if proto_tx.send(Ok(proto_event)).await.is_err() {
@@ -405,9 +447,10 @@ impl NodeServices for ApiService {
 
     async fn watch_system(
         &self,
-        _request: Request<()>,
+        request: Request<()>,
     ) -> Result<Response<Self::WatchSystemStream>, Status> {
         // Rune already validated by AuthLayer
+        let permit = self.acquire_stream(&request)?;
 
         let (internal_tx, mut internal_rx) =
             tokio::sync::mpsc::channel::<crate::events::types::Event>(64);
@@ -418,13 +461,15 @@ impl NodeServices for ApiService {
 
         router
             .subscribe("system", subscriber_id.clone(), internal_tx)
-            .await;
+            .await
+            .map_err(subscribe_status)?;
 
         let router_clone = router.clone();
         let sub_id = subscriber_id.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             tracing::info!(subscriber_id = %sub_id, "watch_system subscribed");
-            while let Some(event) = internal_rx.recv().await {
+            while let Some(event) = next_event_or_cancel(&mut internal_rx, &proto_tx).await {
                 tracing::debug!(subscriber_id = %sub_id, "system event received");
                 if let Some(proto_event) =
                     crate::domain::info::system_events::to_proto_event(&event)

@@ -11,6 +11,31 @@ pub type SubscriberId = String;
 /// Default consecutive send failures before a slow subscriber is dropped.
 pub const DEFAULT_SLOW_SUBSCRIBER_MAX_DROPS: u64 = 64;
 
+/// Subscriber caps and slow-consumer policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RouterLimits {
+    pub max_subscribers_global: usize,
+    pub max_subscribers_per_type: usize,
+    pub slow_subscriber_max_drops: u64,
+}
+
+impl Default for RouterLimits {
+    fn default() -> Self {
+        Self {
+            max_subscribers_global: 512,
+            max_subscribers_per_type: 256,
+            slow_subscriber_max_drops: DEFAULT_SLOW_SUBSCRIBER_MAX_DROPS,
+        }
+    }
+}
+
+/// Reason a subscription was refused by the router.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscribeError {
+    GlobalLimit,
+    TypeLimit,
+}
+
 struct Subscriber {
     id: SubscriberId,
     sender: mpsc::Sender<Event>,
@@ -34,34 +59,63 @@ pub struct EventRouterStats {
 
 pub struct EventRouter {
     subscribers: Arc<RwLock<HashMap<String, Vec<Subscriber>>>>,
+    max_subscribers_global: usize,
+    max_subscribers_per_type: usize,
     slow_subscriber_max_drops: u64,
     stats: Arc<EventRouterStats>,
 }
 
 impl EventRouter {
     pub fn new() -> Self {
-        Self::with_max_drops(DEFAULT_SLOW_SUBSCRIBER_MAX_DROPS)
+        Self::with_limits(RouterLimits::default())
     }
 
     /// Router that drops a subscriber after `max_drops` consecutive failed
-    /// sends.
+    /// sends, keeping the default subscriber caps.
     pub fn with_max_drops(slow_subscriber_max_drops: u64) -> Self {
+        Self::with_limits(RouterLimits {
+            slow_subscriber_max_drops,
+            ..RouterLimits::default()
+        })
+    }
+
+    /// Router with explicit subscriber caps and slow-consumer policy.
+    pub fn with_limits(limits: RouterLimits) -> Self {
         Self {
             subscribers: Arc::new(RwLock::new(HashMap::new())),
-            slow_subscriber_max_drops: slow_subscriber_max_drops.max(1),
+            max_subscribers_global: limits.max_subscribers_global.max(1),
+            max_subscribers_per_type: limits.max_subscribers_per_type.max(1),
+            slow_subscriber_max_drops: limits.slow_subscriber_max_drops.max(1),
             stats: Arc::new(EventRouterStats::default()),
         }
     }
 
-    pub async fn subscribe(&self, event_type: &str, id: SubscriberId, sender: mpsc::Sender<Event>) {
+    /// Register a subscriber, enforcing the global and per-event-type caps.
+    pub async fn subscribe(
+        &self,
+        event_type: &str,
+        id: SubscriberId,
+        sender: mpsc::Sender<Event>,
+    ) -> Result<(), SubscribeError> {
         let mut subs = self.subscribers.write().await;
+
+        let type_count = subs.get(event_type).map_or(0, |list| list.len());
+        if type_count >= self.max_subscribers_per_type {
+            return Err(SubscribeError::TypeLimit);
+        }
+        let total: usize = subs.values().map(|list| list.len()).sum();
+        if total >= self.max_subscribers_global {
+            return Err(SubscribeError::GlobalLimit);
+        }
+
         subs.entry(event_type.to_string())
-            .or_insert_with(Vec::new)
+            .or_default()
             .push(Subscriber {
                 id,
                 sender,
                 drops: Arc::new(AtomicU64::new(0)),
             });
+        Ok(())
     }
 
     pub async fn unsubscribe(&self, event_type: &str, id: &str) {
@@ -189,7 +243,10 @@ mod tests {
     async fn subscribe_and_count() {
         let router = EventRouter::new();
         let (tx, _rx) = mpsc::channel(16);
-        router.subscribe("payment", "sub-1".into(), tx).await;
+        router
+            .subscribe("payment", "sub-1".into(), tx)
+            .await
+            .unwrap();
         assert_eq!(router.subscriber_count("payment").await, 1);
         assert_eq!(router.subscriber_count("invoice").await, 0);
     }
@@ -198,7 +255,10 @@ mod tests {
     async fn unsubscribe_removes_subscriber() {
         let router = EventRouter::new();
         let (tx, _rx) = mpsc::channel(16);
-        router.subscribe("payment", "sub-1".into(), tx).await;
+        router
+            .subscribe("payment", "sub-1".into(), tx)
+            .await
+            .unwrap();
         assert_eq!(router.subscriber_count("payment").await, 1);
         router.unsubscribe("payment", "sub-1").await;
         assert_eq!(router.subscriber_count("payment").await, 0);
@@ -208,7 +268,10 @@ mod tests {
     async fn dispatch_delivers_event() {
         let router = EventRouter::new();
         let (tx, mut rx) = mpsc::channel(16);
-        router.subscribe("payment", "sub-1".into(), tx).await;
+        router
+            .subscribe("payment", "sub-1".into(), tx)
+            .await
+            .unwrap();
 
         router.dispatch("payment", payment_event("evt-1")).await;
 
@@ -220,7 +283,10 @@ mod tests {
     async fn dispatch_does_not_cross_types() {
         let router = EventRouter::new();
         let (tx, mut rx) = mpsc::channel(16);
-        router.subscribe("payment", "sub-1".into(), tx).await;
+        router
+            .subscribe("payment", "sub-1".into(), tx)
+            .await
+            .unwrap();
 
         let event = Event::Invoice(InvoiceEvent::Paid {
             event_id: "evt-2".into(),
@@ -244,8 +310,14 @@ mod tests {
         let router = EventRouter::new();
         let (tx1, mut rx1) = mpsc::channel(16);
         let (tx2, mut rx2) = mpsc::channel(16);
-        router.subscribe("payment", "sub-1".into(), tx1).await;
-        router.subscribe("payment", "sub-2".into(), tx2).await;
+        router
+            .subscribe("payment", "sub-1".into(), tx1)
+            .await
+            .unwrap();
+        router
+            .subscribe("payment", "sub-2".into(), tx2)
+            .await
+            .unwrap();
 
         let event = Event::Payment(PaymentEvent::PartStart {
             event_id: "evt-3".into(),
@@ -271,7 +343,10 @@ mod tests {
     async fn dead_sender_is_removed_during_dispatch() {
         let router = EventRouter::new();
         let (tx, rx) = mpsc::channel(16);
-        router.subscribe("payment", "sub-1".into(), tx).await;
+        router
+            .subscribe("payment", "sub-1".into(), tx)
+            .await
+            .unwrap();
         drop(rx); // receiver dropped
 
         // Must not panic, and the dead subscriber must be gone afterwards.
@@ -289,9 +364,18 @@ mod tests {
         let (tx1, _rx1) = mpsc::channel(16);
         let (tx2, _rx2) = mpsc::channel(16);
         let (tx3, _rx3) = mpsc::channel(16);
-        router.subscribe("payment", "sub-1".into(), tx1).await;
-        router.subscribe("invoice", "sub-2".into(), tx2).await;
-        router.subscribe("payment", "sub-3".into(), tx3).await;
+        router
+            .subscribe("payment", "sub-1".into(), tx1)
+            .await
+            .unwrap();
+        router
+            .subscribe("invoice", "sub-2".into(), tx2)
+            .await
+            .unwrap();
+        router
+            .subscribe("payment", "sub-3".into(), tx3)
+            .await
+            .unwrap();
         assert_eq!(router.total_subscribers().await, 3);
     }
 
@@ -304,8 +388,12 @@ mod tests {
         let (fast_tx, mut fast_rx) = mpsc::channel(16);
         router
             .subscribe("payment", "slow".into(), slow_tx.clone())
-            .await;
-        router.subscribe("payment", "fast".into(), fast_tx).await;
+            .await
+            .unwrap();
+        router
+            .subscribe("payment", "fast".into(), fast_tx)
+            .await
+            .unwrap();
 
         // Fill the slow subscriber's only slot.
         slow_tx.try_send(payment_event("filler")).unwrap();
@@ -333,7 +421,8 @@ mod tests {
         let (slow_tx, _slow_rx) = mpsc::channel(1);
         router
             .subscribe("payment", "slow".into(), slow_tx.clone())
-            .await;
+            .await
+            .unwrap();
         slow_tx.try_send(payment_event("filler")).unwrap();
 
         for i in 0..2 {
@@ -372,7 +461,10 @@ mod tests {
     async fn draining_the_channel_resets_the_drop_counter() {
         let router = EventRouter::with_max_drops(2);
         let (tx, mut rx) = mpsc::channel(1);
-        router.subscribe("payment", "sub".into(), tx.clone()).await;
+        router
+            .subscribe("payment", "sub".into(), tx.clone())
+            .await
+            .unwrap();
         tx.try_send(payment_event("filler")).unwrap();
 
         // First dispatch fails (channel full after the filler).
@@ -401,8 +493,12 @@ mod tests {
         let (ok_tx, mut ok_rx) = mpsc::channel(16);
         router
             .subscribe("payment", "full".into(), full_tx.clone())
-            .await;
-        router.subscribe("payment", "ok".into(), ok_tx).await;
+            .await
+            .unwrap();
+        router
+            .subscribe("payment", "ok".into(), ok_tx)
+            .await
+            .unwrap();
         full_tx.try_send(payment_event("filler")).unwrap();
 
         router.dispatch("payment", payment_event("evt-1")).await;
@@ -412,5 +508,74 @@ mod tests {
         assert_eq!(stats.events_delivered.load(Ordering::Relaxed), 1);
         assert_eq!(stats.events_dropped.load(Ordering::Relaxed), 1);
         assert_eq!(ok_rx.recv().await.unwrap().event_id(), "evt-1");
+    }
+
+    // --- Subscriber caps ---
+
+    #[tokio::test]
+    async fn subscribe_enforces_per_type_limit() {
+        let router = EventRouter::with_limits(RouterLimits {
+            max_subscribers_global: 10,
+            max_subscribers_per_type: 2,
+            slow_subscriber_max_drops: 64,
+        });
+        let (tx1, _rx1) = mpsc::channel(4);
+        let (tx2, _rx2) = mpsc::channel(4);
+        let (tx3, _rx3) = mpsc::channel(4);
+
+        router.subscribe("payment", "s1".into(), tx1).await.unwrap();
+        router.subscribe("payment", "s2".into(), tx2).await.unwrap();
+        assert_eq!(
+            router
+                .subscribe("payment", "s3".into(), tx3)
+                .await
+                .unwrap_err(),
+            SubscribeError::TypeLimit
+        );
+        assert_eq!(router.subscriber_count("payment").await, 2);
+    }
+
+    #[tokio::test]
+    async fn subscribe_enforces_global_limit() {
+        let router = EventRouter::with_limits(RouterLimits {
+            max_subscribers_global: 2,
+            max_subscribers_per_type: 10,
+            slow_subscriber_max_drops: 64,
+        });
+        let (tx1, _rx1) = mpsc::channel(4);
+        let (tx2, _rx2) = mpsc::channel(4);
+        let (tx3, _rx3) = mpsc::channel(4);
+
+        router.subscribe("payment", "s1".into(), tx1).await.unwrap();
+        router.subscribe("invoice", "s2".into(), tx2).await.unwrap();
+        assert_eq!(
+            router
+                .subscribe("peer", "s3".into(), tx3)
+                .await
+                .unwrap_err(),
+            SubscribeError::GlobalLimit
+        );
+        assert_eq!(router.total_subscribers().await, 2);
+    }
+
+    #[tokio::test]
+    async fn unsubscribe_frees_subscriber_budget() {
+        let router = EventRouter::with_limits(RouterLimits {
+            max_subscribers_global: 1,
+            max_subscribers_per_type: 1,
+            slow_subscriber_max_drops: 64,
+        });
+        let (tx1, _rx1) = mpsc::channel(4);
+        let (tx2, _rx2) = mpsc::channel(4);
+
+        router.subscribe("payment", "s1".into(), tx1).await.unwrap();
+        assert!(router
+            .subscribe("payment", "s2".into(), tx2.clone())
+            .await
+            .is_err());
+
+        router.unsubscribe("payment", "s1").await;
+        router.subscribe("payment", "s2".into(), tx2).await.unwrap();
+        assert_eq!(router.total_subscribers().await, 1);
     }
 }

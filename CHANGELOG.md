@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Added
+- `StreamLimits` (`src/grpc/stream_limits.rs`): global and per-fingerprint
+  concurrent-stream budgets with RAII permits. All six streaming RPCs reserve
+  a slot before any backend side effect and reject over-limit clients with
+  `RESOURCE_EXHAUSTED` (GCOB-002)
+- `next_event_or_cancel`: streaming tasks detect a client disconnect through
+  `Sender::closed()` even when no events arrive, then unsubscribe and release
+  the stream permit (GCOB-004)
+- Router subscriber caps `GCOB_MAX_SUBSCRIBERS_GLOBAL` and
+  `GCOB_MAX_SUBSCRIBERS_PER_TYPE`; `EventRouter::subscribe` returns
+  `SubscribeError` when either budget is full
+
 ### Changed
 - `EventRouter` dispatch is non-blocking: senders are snapshotted under a
   short read lock, delivery uses `try_send`, and dead or persistently slow

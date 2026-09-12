@@ -8,7 +8,7 @@ use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use crate::certs::mtls_certs::ClnConfig;
 use crate::cln::client::ClnClient;
 use crate::cln::cln_api::node_services_server::NodeServicesServer;
-use crate::events::router::EventRouter;
+use crate::events::router::{EventRouter, RouterLimits};
 use crate::events::subscribers::ClnEventBridge;
 use crate::grpc::interceptors::admission_layer::AdmissionLayer;
 use crate::grpc::interceptors::auth_layer::AuthLayer;
@@ -16,10 +16,12 @@ use crate::grpc::interceptors::identity::ClientIdentityLayer;
 use crate::grpc::interceptors::rate_limit_layer::RateLimitLayer;
 use crate::grpc::interceptors::rate_limiter::InMemoryRateLimiter;
 use crate::grpc::limits::Limits;
+use crate::grpc::stream_limits::StreamLimits;
 
 pub struct ApiService {
     pub client: Arc<ClnClient>,
     pub event_router: Arc<EventRouter>,
+    pub stream_limits: Arc<StreamLimits>,
 }
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -57,9 +59,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .client_ca_root(Certificate::from_pem(ca_cert));
 
     // --- Event bridge setup ---
-    let router = Arc::new(EventRouter::with_max_drops(
-        limits.slow_subscriber_max_drops,
-    ));
+    let router = Arc::new(EventRouter::with_limits(RouterLimits {
+        max_subscribers_global: limits.max_subscribers_global,
+        max_subscribers_per_type: limits.max_subscribers_per_type,
+        slow_subscriber_max_drops: limits.slow_subscriber_max_drops,
+    }));
     let mut bridge = ClnEventBridge::new(client.inner.clone(), router.clone());
     let bridge_handle = tokio::spawn(async move {
         bridge.start_all().await;
@@ -80,6 +84,10 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let api_service = ApiService {
         client: Arc::new(client),
         event_router: router,
+        stream_limits: StreamLimits::new(
+            limits.max_active_streams_global,
+            limits.max_active_streams_per_client,
+        ),
     };
 
     tracing::info!("gRPC API server listening on {}", addr);
