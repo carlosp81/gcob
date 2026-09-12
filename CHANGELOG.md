@@ -1,5 +1,49 @@
 # Changelog
 
+## [0.5.5] - 2026-09-12
+
+Rune-handling and availability hardening: strict env-file permissions, idle
+stream-client reclamation, linear router eviction and a validated invariant
+suite.
+
+### Added
+- `StreamLimits::cleanup_idle` with a race-safe guard (`Arc::strong_count == 1`
+  and all permits available) plus a 300 s cleanup task in `gcob serve`, so the
+  per-fingerprint map no longer retains idle entries (GCOB-013)
+- `StreamLimits::tracked_clients`/`idle_clients` and
+  `InMemoryRateLimiter::tracked_keys` gauges, emitted by a periodic
+  availability snapshot (60 s) with streams, clients, subscribers, router
+  counters and fallback buckets
+- Concurrency and soak coverage for `StreamLimits` (100 concurrent acquires;
+  nightly `#[ignore]` soak with a concurrent cleaner) and a fan-out benchmark
+- Symlink race test for `read_secure_file` (AV-008) and an end-to-end
+  `max_concurrent_streams` test over mTLS with a mock CLN backend (AV-007)
+- `security/availability-validation.md`: 12 invariants and the AV-001…AV-008
+  matrix mapped to their tests, plus `cargo deny`/`cargo audit` results
+- `.github/workflows/nightly.yml`: soak/benchmark job (`--include-ignored`)
+
+### Changed
+- `EventRouter` eviction uses a `HashSet` (O(N) instead of O(N·M)) and the
+  global subscriber cap uses an O(1) counter maintained under the write lock;
+  explicit unsubscribes and evictions share the same accounting
+- Rune hardening: the accepted `x-rune` is held in a zeroizing buffer, at most
+  one header is accepted, and length (<= 4 KiB) and base64url/restriction
+  charset are validated before any `check_rune` call; `build_checkrune_request`
+  is covered by unit tests
+- `fanout_dispatch_bench` measures 512 subscribers × 200 events at ~1 320
+  ns/delivery; the `Arc<Event>` refactor (GCOB-015) stays deferred
+
+### Fixed
+- The trusted env file now requires mode `0600` or `0640`; group/other-readable
+  files such as `0644` are refused because they can hold the CLN rune.
+  **Action required**: `chmod 0600 /etc/gcob/gcob.env` (or `0640` with an
+  explicit group) before upgrading
+
+### Notes
+- GCOB-008 (global connection/IP cap) remains delegated to HAProxy/OS by
+  decision; GCOB-012/013/014 are closed and GCOB-015 is deferred with data
+- Real-CLN validation (profiles A/B/C, RSS/p99) is pending laboratory work
+
 ## [0.5.4] - 2026-09-12
 
 Streaming resource limits, post-release fixes and end-to-end mTLS coverage.
