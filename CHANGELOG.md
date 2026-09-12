@@ -1,6 +1,8 @@
 # Changelog
 
-## [Unreleased]
+## [0.5.4] - 2026-09-12
+
+Streaming resource limits, post-release fixes and end-to-end mTLS coverage.
 
 ### Added
 - `StreamLimits` (`src/grpc/stream_limits.rs`): global and per-fingerprint
@@ -13,6 +15,13 @@
 - Router subscriber caps `GCOB_MAX_SUBSCRIBERS_GLOBAL` and
   `GCOB_MAX_SUBSCRIBERS_PER_TYPE`; `EventRouter::subscribe` returns
   `SubscribeError` when either budget is full
+- `deny.toml` and a `supply-chain` CI job (`cargo-deny`: advisories, licenses,
+  bans, sources) plus weekly Dependabot updates for Cargo and GitHub Actions
+  (GCOB-010)
+- End-to-end mTLS tests (`src/grpc/e2e_tests.rs`) that run the real
+  identity/admission/auth/rate-limit stack behind a tonic server with an
+  ephemeral `rcgen` PKI, plus bounded-load coverage; `security/findings.md`
+  and `security/availability-invariants.md`
 
 ### Changed
 - `EventRouter` dispatch is non-blocking: senders are snapshotted under a
@@ -56,13 +65,6 @@ pre-auth budget and bounded request bodies.
   remote address, path and latency
 - CI workflow (fmt, clippy `-D warnings`, tests) and
   `security/availability-baseline.md`
-- `deny.toml` and a `supply-chain` CI job (`cargo-deny`: advisories, licenses,
-  bans, sources) plus weekly Dependabot updates for Cargo and GitHub Actions
-  (GCOB-010)
-- End-to-end mTLS tests (`src/grpc/e2e_tests.rs`) that run the real
-  identity/admission/auth/rate-limit stack behind a tonic server with an
-  ephemeral `rcgen` PKI, plus bounded-load coverage; `security/findings.md`
-  and `security/availability-invariants.md`
 
 ### Changed
 - Per-method rate limiting is keyed by certificate fingerprint instead of the
