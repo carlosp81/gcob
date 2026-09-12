@@ -57,7 +57,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .client_ca_root(Certificate::from_pem(ca_cert));
 
     // --- Event bridge setup ---
-    let router = Arc::new(EventRouter::new());
+    let router = Arc::new(EventRouter::with_max_drops(
+        limits.slow_subscriber_max_drops,
+    ));
     let mut bridge = ClnEventBridge::new(client.inner.clone(), router.clone());
     let bridge_handle = tokio::spawn(async move {
         bridge.start_all().await;

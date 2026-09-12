@@ -1,5 +1,13 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- `EventRouter` dispatch is non-blocking: senders are snapshotted under a
+  short read lock, delivery uses `try_send`, and dead or persistently slow
+  subscribers are unsubscribed after `GCOB_SLOW_SUBSCRIBER_MAX_DROPS`
+  consecutive drops (GCOB-005/006)
+
 ## [0.5.3] - 2026-09-12
 
 Admission control hardened: certificate-bound rate limiting, a cheap

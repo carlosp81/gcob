@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, RwLock};
@@ -7,19 +8,48 @@ use super::types::Event;
 
 pub type SubscriberId = String;
 
+/// Default consecutive send failures before a slow subscriber is dropped.
+pub const DEFAULT_SLOW_SUBSCRIBER_MAX_DROPS: u64 = 64;
+
 struct Subscriber {
     id: SubscriberId,
     sender: mpsc::Sender<Event>,
+    /// Consecutive events dropped because the channel was full. Reset to zero
+    /// whenever a send succeeds.
+    drops: Arc<AtomicU64>,
+}
+
+/// Availability counters for the event fan-out.
+#[derive(Debug, Default)]
+pub struct EventRouterStats {
+    /// Dispatches that had at least one subscriber.
+    pub events_dispatched: AtomicU64,
+    /// Events handed to a subscriber channel.
+    pub events_delivered: AtomicU64,
+    /// Events discarded because a subscriber channel was full or closed.
+    pub events_dropped: AtomicU64,
+    /// Subscribers removed for being dead or persistently slow.
+    pub subscribers_dropped: AtomicU64,
 }
 
 pub struct EventRouter {
     subscribers: Arc<RwLock<HashMap<String, Vec<Subscriber>>>>,
+    slow_subscriber_max_drops: u64,
+    stats: Arc<EventRouterStats>,
 }
 
 impl EventRouter {
     pub fn new() -> Self {
+        Self::with_max_drops(DEFAULT_SLOW_SUBSCRIBER_MAX_DROPS)
+    }
+
+    /// Router that drops a subscriber after `max_drops` consecutive failed
+    /// sends.
+    pub fn with_max_drops(slow_subscriber_max_drops: u64) -> Self {
         Self {
             subscribers: Arc::new(RwLock::new(HashMap::new())),
+            slow_subscriber_max_drops: slow_subscriber_max_drops.max(1),
+            stats: Arc::new(EventRouterStats::default()),
         }
     }
 
@@ -27,7 +57,11 @@ impl EventRouter {
         let mut subs = self.subscribers.write().await;
         subs.entry(event_type.to_string())
             .or_insert_with(Vec::new)
-            .push(Subscriber { id, sender });
+            .push(Subscriber {
+                id,
+                sender,
+                drops: Arc::new(AtomicU64::new(0)),
+            });
     }
 
     pub async fn unsubscribe(&self, event_type: &str, id: &str) {
@@ -40,25 +74,75 @@ impl EventRouter {
         }
     }
 
+    /// Deliver an event without ever holding the subscriber lock across a
+    /// send and without blocking on a slow subscriber.
+    ///
+    /// Senders are snapshotted under a short read lock; delivery uses
+    /// `try_send`, so a full or closed channel costs nothing and the event is
+    /// counted as dropped. A subscriber that keeps failing is unsubscribed
+    /// after [`Self::slow_subscriber_max_drops`] consecutive drops.
     pub async fn dispatch(&self, event_type: &str, event: Event) {
-        let subs = self.subscribers.read().await;
-        if let Some(list) = subs.get(event_type) {
-            let mut dead = Vec::new();
-            for (i, sub) in list.iter().enumerate() {
-                if sub.sender.send(event.clone()).await.is_err() {
-                    dead.push(i);
+        let snapshot: Vec<(SubscriberId, mpsc::Sender<Event>, Arc<AtomicU64>)> = {
+            let subs = self.subscribers.read().await;
+            subs.get(event_type)
+                .map(|list| {
+                    list.iter()
+                        .map(|s| (s.id.clone(), s.sender.clone(), s.drops.clone()))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+
+        if snapshot.is_empty() {
+            return;
+        }
+
+        self.stats.events_dispatched.fetch_add(1, Ordering::Relaxed);
+        let mut to_remove: Vec<SubscriberId> = Vec::new();
+
+        for (id, sender, drops) in snapshot {
+            match sender.try_send(event.clone()) {
+                Ok(()) => {
+                    drops.store(0, Ordering::Relaxed);
+                    self.stats.events_delivered.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    self.stats.events_dropped.fetch_add(1, Ordering::Relaxed);
+                    let consecutive = drops.fetch_add(1, Ordering::Relaxed) + 1;
+                    if consecutive >= self.slow_subscriber_max_drops {
+                        to_remove.push(id);
+                    }
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.stats.events_dropped.fetch_add(1, Ordering::Relaxed);
+                    to_remove.push(id);
                 }
             }
-            // NOTE: dead subscribers are not removed during read lock.
-            // They will be cleaned up on next write (subscribe/unsubscribe).
-            if !dead.is_empty() {
-                tracing::warn!(
-                    "Dispatched to {} dead subscribers for event_type={}",
-                    dead.len(),
-                    event_type
-                );
-            }
         }
+
+        if !to_remove.is_empty() {
+            let removed = to_remove.len() as u64;
+            let mut subs = self.subscribers.write().await;
+            if let Some(list) = subs.get_mut(event_type) {
+                list.retain(|s| !to_remove.contains(&s.id));
+                if list.is_empty() {
+                    subs.remove(event_type);
+                }
+            }
+            drop(subs);
+            self.stats
+                .subscribers_dropped
+                .fetch_add(removed, Ordering::Relaxed);
+            tracing::warn!(event_type, removed, "Unsubscribed dead or slow subscribers");
+        }
+    }
+
+    pub fn stats(&self) -> Arc<EventRouterStats> {
+        self.stats.clone()
+    }
+
+    pub fn slow_subscriber_max_drops(&self) -> u64 {
+        self.slow_subscriber_max_drops
     }
 
     pub async fn subscriber_count(&self, event_type: &str) -> usize {
@@ -86,6 +170,20 @@ impl Default for EventRouter {
 mod tests {
     use super::super::types::*;
     use super::*;
+    use std::time::Duration;
+
+    fn payment_event(id: &str) -> Event {
+        Event::Payment(PaymentEvent::Succeeded {
+            event_id: id.into(),
+            timestamp: 1000,
+            payment_hash: "abc".into(),
+            preimage: "secret".into(),
+            amount_msat: 1000,
+            amount_sent_msat: 1010,
+            node_id: "02ab".into(),
+            created_at: 999,
+        })
+    }
 
     #[tokio::test]
     async fn subscribe_and_count() {
@@ -112,18 +210,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(16);
         router.subscribe("payment", "sub-1".into(), tx).await;
 
-        let event = Event::Payment(PaymentEvent::Succeeded {
-            event_id: "evt-1".into(),
-            timestamp: 1000,
-            payment_hash: "abc".into(),
-            preimage: "secret".into(),
-            amount_msat: 1000,
-            amount_sent_msat: 1010,
-            node_id: "02ab".into(),
-            created_at: 999,
-        });
-
-        router.dispatch("payment", event).await;
+        router.dispatch("payment", payment_event("evt-1")).await;
 
         let received = rx.recv().await.expect("should receive event");
         assert_eq!(received.event_id(), "evt-1");
@@ -181,22 +268,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dead_sender_handled_gracefully() {
+    async fn dead_sender_is_removed_during_dispatch() {
         let router = EventRouter::new();
-        let (tx, _rx) = mpsc::channel(16);
+        let (tx, rx) = mpsc::channel(16);
         router.subscribe("payment", "sub-1".into(), tx).await;
-        drop(_rx); // receiver dropped
+        drop(rx); // receiver dropped
 
-        let event = Event::Payment(PaymentEvent::PartEnd {
-            event_id: "evt-4".into(),
-            timestamp: 1003,
-            payment_hash: "jkl".into(),
-            partid: 1,
-            amount_msat: 200,
-        });
-
-        // Should not panic
-        router.dispatch("payment", event).await;
+        // Must not panic, and the dead subscriber must be gone afterwards.
+        router.dispatch("payment", payment_event("evt-4")).await;
+        assert_eq!(router.subscriber_count("payment").await, 0);
+        assert_eq!(
+            router.stats().subscribers_dropped.load(Ordering::Relaxed),
+            1
+        );
     }
 
     #[tokio::test]
@@ -209,5 +293,124 @@ mod tests {
         router.subscribe("invoice", "sub-2".into(), tx2).await;
         router.subscribe("payment", "sub-3".into(), tx3).await;
         assert_eq!(router.total_subscribers().await, 3);
+    }
+
+    // --- GCOB-005/006 regression tests ---
+
+    #[tokio::test]
+    async fn dispatch_does_not_block_on_full_subscriber() {
+        let router = EventRouter::new();
+        let (slow_tx, _slow_rx) = mpsc::channel(1);
+        let (fast_tx, mut fast_rx) = mpsc::channel(16);
+        router
+            .subscribe("payment", "slow".into(), slow_tx.clone())
+            .await;
+        router.subscribe("payment", "fast".into(), fast_tx).await;
+
+        // Fill the slow subscriber's only slot.
+        slow_tx.try_send(payment_event("filler")).unwrap();
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            router.dispatch("payment", payment_event("evt-5")),
+        )
+        .await
+        .expect("dispatch must not block on a full subscriber channel");
+
+        // The healthy subscriber still receives the event.
+        let received = fast_rx.recv().await.expect("fast subscriber receives");
+        assert_eq!(received.event_id(), "evt-5");
+        assert_eq!(
+            router.stats().events_dropped.load(Ordering::Relaxed),
+            1,
+            "the full channel must be counted as a drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn slow_subscriber_is_dropped_after_max_consecutive_drops() {
+        let router = EventRouter::with_max_drops(3);
+        let (slow_tx, _slow_rx) = mpsc::channel(1);
+        router
+            .subscribe("payment", "slow".into(), slow_tx.clone())
+            .await;
+        slow_tx.try_send(payment_event("filler")).unwrap();
+
+        for i in 0..2 {
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                router.dispatch("payment", payment_event(&format!("evt-{i}"))),
+            )
+            .await
+            .expect("dispatch must not block");
+            assert_eq!(
+                router.subscriber_count("payment").await,
+                1,
+                "subscriber must survive until the threshold"
+            );
+        }
+
+        tokio::time::timeout(
+            Duration::from_millis(100),
+            router.dispatch("payment", payment_event("evt-3")),
+        )
+        .await
+        .expect("dispatch must not block");
+
+        assert_eq!(
+            router.subscriber_count("payment").await,
+            0,
+            "subscriber must be unsubscribed at the threshold"
+        );
+        assert_eq!(
+            router.stats().subscribers_dropped.load(Ordering::Relaxed),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn draining_the_channel_resets_the_drop_counter() {
+        let router = EventRouter::with_max_drops(2);
+        let (tx, mut rx) = mpsc::channel(1);
+        router.subscribe("payment", "sub".into(), tx.clone()).await;
+        tx.try_send(payment_event("filler")).unwrap();
+
+        // First dispatch fails (channel full after the filler).
+        router.dispatch("payment", payment_event("evt-1")).await;
+        // Drain the filler so the next send succeeds.
+        let _ = rx.recv().await;
+        router.dispatch("payment", payment_event("evt-2")).await;
+        // Drain the delivered event before filling the single slot again.
+        let _ = rx.recv().await;
+        // The counter must have been reset by the successful send, so the
+        // subscriber survives another full-channel dispatch.
+        tx.try_send(payment_event("filler-2")).unwrap();
+        router.dispatch("payment", payment_event("evt-3")).await;
+
+        assert_eq!(
+            router.subscriber_count("payment").await,
+            1,
+            "a successful send must reset consecutive drops"
+        );
+    }
+
+    #[tokio::test]
+    async fn stats_track_delivered_and_dropped() {
+        let router = EventRouter::new();
+        let (full_tx, _full_rx) = mpsc::channel(1);
+        let (ok_tx, mut ok_rx) = mpsc::channel(16);
+        router
+            .subscribe("payment", "full".into(), full_tx.clone())
+            .await;
+        router.subscribe("payment", "ok".into(), ok_tx).await;
+        full_tx.try_send(payment_event("filler")).unwrap();
+
+        router.dispatch("payment", payment_event("evt-1")).await;
+
+        let stats = router.stats();
+        assert_eq!(stats.events_dispatched.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.events_delivered.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.events_dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(ok_rx.recv().await.unwrap().event_id(), "evt-1");
     }
 }
