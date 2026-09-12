@@ -255,17 +255,21 @@ gcob/
 ```env
 # CLN Connection
 CLN_NODE_URI=https://YOUR_SERVER_IP:50002
+CLN_HOSTNAME=your-node
 
 # Server
 GRPC_BIND_ADDR=0.0.0.0:50003
 
-# TLS
-CERT_DIR=/etc/zapt81/certs
-CA_FILE=ca.pem
-CLIENT_FILE=client.pem
-CLIENT_KEY_FILE=client-key.pem
-SERVER_FILE=debian-knots.pem
+# TLS (CLN_CERT_DIR defaults to the admin account's ~/.certs)
+# CLN_CERT_DIR=/home/<admin>/.certs
+CLN_CA_FILE=ca.pem
+CLN_CLIENT_FILE=client.pem
+CLN_CLIENT_KEY_FILE=client-key.pem
+SERVER_CERT_FILE=server.pem
 SERVER_KEY_FILE=server-key.pem
+
+# Client (gcob-client): --ca/--cert/--key override CLN_CERT_DIR; when none of
+# them is set, the admin account's ~/.certs directory is used.
 
 # Redis (optional)
 REDIS_URL=redis://127.0.0.1:6379

@@ -6,8 +6,8 @@ use std::task::{Context, Poll};
 use bytes::Bytes;
 use http_body_util::BodyExt;
 use prost::Message;
-use tower::{Layer, Service};
 use tonic::Status;
+use tower::{Layer, Service};
 
 use crate::cln::client::ClnClient;
 use crate::cln::cln_api;
@@ -32,9 +32,22 @@ fn rune_method_for_path(path: &str) -> Option<&'static str> {
     }
 }
 
+/// Convert a gRPC status into an HTTP response so the stream is not reset.
+///
+/// Returning `Err` from the tower service is treated by hyper as a fatal
+/// connection error (`RST_STREAM`), which the client reports as
+/// "h2 protocol error" instead of the real gRPC status.
+fn status_response(status: Status) -> http::Response<tonic::body::Body> {
+    tracing::warn!(
+        code = ?status.code(),
+        message = %status.message(),
+        "Auth rejected"
+    );
+    status.into_http()
+}
+
 fn unauthenticated_response(message: &str) -> http::Response<tonic::body::Body> {
-    tracing::warn!(message = %message, "Auth rejected");
-    Status::unauthenticated(message).into_http()
+    status_response(Status::unauthenticated(message))
 }
 
 // --- Protobuf param extraction for rune validation ---
@@ -155,25 +168,24 @@ where
             let (parts, body) = req.into_parts();
 
             // Collect body bytes for protobuf decoding
-            let body_bytes: Bytes = body
-                .collect()
-                .await
-                .map_err(|e| {
-                    let msg = format!("Failed to read request body: {}", e);
-                    Box::new(std::io::Error::other(msg))
-                        as Box<dyn std::error::Error + Send + Sync>
-                })?
-                .to_bytes();
+            let body_bytes: Bytes = match body.collect().await {
+                Ok(collected) => collected.to_bytes(),
+                Err(e) => {
+                    return Ok(status_response(Status::internal(format!(
+                        "Failed to read request body: {e}"
+                    ))));
+                }
+            };
 
             // Extract params from protobuf body
             let params = extract_params_for_path(&path, &body_bytes);
 
-            // Async rune validation via CLN check_rune (now with params)
-            validate_rune(&client, &rune, method, params).await.map_err(|e| {
-                let msg = e.message().to_string();
-                Box::new(std::io::Error::other(msg))
-                    as Box<dyn std::error::Error + Send + Sync>
-            })?;
+            // Async rune validation via CLN check_rune (now with params). A
+            // rejected rune is a gRPC status response; returning Err here would
+            // reset the HTTP/2 stream and hide the real error from the client.
+            if let Err(status) = validate_rune(&client, &rune, method, params).await {
+                return Ok(status_response(status));
+            }
 
             tracing::info!(path = %path, method = %method, "Rune validated - request allowed through");
 
@@ -189,19 +201,48 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use tower::service_fn;
 
     #[test]
     fn method_mapping_all_rpc_paths() {
-        assert_eq!(rune_method_for_path("/cln.NodeServices/Invoice"), Some("invoice"));
-        assert_eq!(rune_method_for_path("/cln.NodeServices/Getinfo"), Some("getinfo"));
+        assert_eq!(
+            rune_method_for_path("/cln.NodeServices/Invoice"),
+            Some("invoice")
+        );
+        assert_eq!(
+            rune_method_for_path("/cln.NodeServices/Getinfo"),
+            Some("getinfo")
+        );
         assert_eq!(rune_method_for_path("/cln.NodeServices/Xpay"), Some("xpay"));
-        assert_eq!(rune_method_for_path("/cln.NodeServices/InvoiceStream"), Some("invoice"));
-        assert_eq!(rune_method_for_path("/cln.NodeServices/XpayStreamWatch"), Some("xpay"));
-        assert_eq!(rune_method_for_path("/cln.NodeServices/XpayStream"), Some("xpay_stream"));
-        assert_eq!(rune_method_for_path("/cln.NodeServices/InvoiceWatch"), Some("invoice_watch"));
-        assert_eq!(rune_method_for_path("/cln.NodeServices/WatchChannels"), Some("watch_channels"));
-        assert_eq!(rune_method_for_path("/cln.NodeServices/WatchPeers"), Some("watch_peers"));
-        assert_eq!(rune_method_for_path("/cln.NodeServices/WatchSystem"), Some("watch_system"));
+        assert_eq!(
+            rune_method_for_path("/cln.NodeServices/InvoiceStream"),
+            Some("invoice")
+        );
+        assert_eq!(
+            rune_method_for_path("/cln.NodeServices/XpayStreamWatch"),
+            Some("xpay")
+        );
+        assert_eq!(
+            rune_method_for_path("/cln.NodeServices/XpayStream"),
+            Some("xpay_stream")
+        );
+        assert_eq!(
+            rune_method_for_path("/cln.NodeServices/InvoiceWatch"),
+            Some("invoice_watch")
+        );
+        assert_eq!(
+            rune_method_for_path("/cln.NodeServices/WatchChannels"),
+            Some("watch_channels")
+        );
+        assert_eq!(
+            rune_method_for_path("/cln.NodeServices/WatchPeers"),
+            Some("watch_peers")
+        );
+        assert_eq!(
+            rune_method_for_path("/cln.NodeServices/WatchSystem"),
+            Some("watch_system")
+        );
     }
 
     #[test]
@@ -296,7 +337,7 @@ mod tests {
         // into_http() returns HTTP 200; gRPC status is in the body (grpc-status header)
         // The actual gRPC status code is embedded in the response body
         assert_eq!(resp.status(), 200); // HTTP status is 200
-        // The gRPC status is in the grpc-status header
+                                        // The gRPC status is in the grpc-status header
         let grpc_status = resp.headers().get("grpc-status");
         assert!(grpc_status.is_some(), "Should have grpc-status header");
     }
@@ -336,10 +377,19 @@ mod tests {
 
     #[test]
     fn rune_method_for_path_returns_correct_method_names() {
-        assert_eq!(rune_method_for_path("/cln.NodeServices/Invoice"), Some("invoice"));
+        assert_eq!(
+            rune_method_for_path("/cln.NodeServices/Invoice"),
+            Some("invoice")
+        );
         assert_eq!(rune_method_for_path("/cln.NodeServices/Xpay"), Some("xpay"));
-        assert_eq!(rune_method_for_path("/cln.NodeServices/XpayStream"), Some("xpay_stream"));
-        assert_eq!(rune_method_for_path("/cln.NodeServices/InvoiceWatch"), Some("invoice_watch"));
+        assert_eq!(
+            rune_method_for_path("/cln.NodeServices/XpayStream"),
+            Some("xpay_stream")
+        );
+        assert_eq!(
+            rune_method_for_path("/cln.NodeServices/InvoiceWatch"),
+            Some("invoice_watch")
+        );
     }
 
     #[test]
@@ -352,5 +402,38 @@ mod tests {
     fn extract_params_xpay_empty_body() {
         let params = extract_params_for_path("/cln.NodeServices/Xpay", &[]);
         assert_eq!(params, vec!["", ""]);
+    }
+
+    #[tokio::test]
+    async fn rejected_rune_returns_grpc_status_instead_of_transport_error() {
+        // Lazy channel to a closed port: check_rune fails fast, and the layer
+        // must translate it into a gRPC response (status 16), never a tower Err
+        // that would reset the HTTP/2 stream.
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let client = Arc::new(ClnClient {
+            inner: cln_api::node_client::NodeClient::new(channel),
+            node_id: "test-node".to_string(),
+        });
+
+        let mut service = AuthLayer::new(client).layer(service_fn(
+            |_req: http::Request<tonic::body::Body>| async {
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(http::Response::new(
+                    tonic::body::Body::new(http_body_util::Full::new(Bytes::new())),
+                ))
+            },
+        ));
+
+        let mut req = http::Request::new(tonic::body::Body::new(http_body_util::Full::new(
+            Bytes::new(),
+        )));
+        req.headers_mut()
+            .insert(RUNE_HEADER, "blacklisted-rune".parse().unwrap());
+        *req.uri_mut() = "/cln.NodeServices/Getinfo".parse().unwrap();
+
+        let response = service
+            .call(req)
+            .await
+            .expect("a rejected rune must produce a gRPC response, not a transport error");
+        assert_eq!(response.headers().get("grpc-status").unwrap(), "16");
     }
 }

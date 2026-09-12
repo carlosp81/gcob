@@ -16,18 +16,27 @@ pub struct ClnConfig {
     pub grpc_bind_addr: String,
 }
 
+/// Resolve the certificate directory: an explicit absolute `CLN_CERT_DIR`, or
+/// the admin account's `~/.certs` when unset/empty.
+fn resolve_cert_dir(value: Option<&str>) -> Result<PathBuf, String> {
+    match value {
+        Some(value) if !value.is_empty() => {
+            let path = PathBuf::from(value);
+            if !path.is_absolute() {
+                return Err(format!("CLN_CERT_DIR is not absolute: {path:?}"));
+            }
+            Ok(path)
+        }
+        _ => crate::certs::paths::default_cert_dir().map_err(|e| {
+            format!("CLN_CERT_DIR is not set and ~/.certs could not be resolved: {e}")
+        }),
+    }
+}
+
 impl ClnConfig {
     pub fn from_env() -> Result<Self, Status> {
-        let cert_dir = env::var("CLN_CERT_DIR")
-            .map(PathBuf::from)
-            .map_err(|_| Status::failed_precondition("CLN_CERT_DIR must be set"))?;
-
-        if !cert_dir.is_absolute() {
-            return Err(Status::failed_precondition(format!(
-                "CLN_CERT_DIR is not absolute: {:?}",
-                cert_dir
-            )));
-        }
+        let cert_dir = resolve_cert_dir(env::var("CLN_CERT_DIR").ok().as_deref())
+            .map_err(Status::failed_precondition)?;
 
         let ca_name = env::var("CLN_CA_FILE").unwrap_or_else(|_| "ca.pem".into());
         let client_name = env::var("CLN_CLIENT_FILE").unwrap_or_else(|_| "client.pem".into());
@@ -161,5 +170,40 @@ impl ClnConfig {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_cert_dir_prefers_absolute_override() {
+        assert_eq!(
+            resolve_cert_dir(Some("/srv/certs")).unwrap(),
+            PathBuf::from("/srv/certs")
+        );
+    }
+
+    #[test]
+    fn resolve_cert_dir_rejects_relative_override() {
+        let err = resolve_cert_dir(Some("certs")).unwrap_err();
+        assert!(err.contains("not absolute"), "{err}");
+    }
+
+    #[test]
+    fn resolve_cert_dir_defaults_to_admin_certs() {
+        match resolve_cert_dir(None) {
+            Ok(path) => assert!(path.ends_with(".certs"), "{path:?}"),
+            Err(e) => assert!(e.contains("CLN_CERT_DIR"), "{e}"),
+        }
+    }
+
+    #[test]
+    fn resolve_cert_dir_empty_falls_back_to_default() {
+        match resolve_cert_dir(Some("")) {
+            Ok(path) => assert!(path.ends_with(".certs"), "{path:?}"),
+            Err(e) => assert!(e.contains("CLN_CERT_DIR"), "{e}"),
+        }
     }
 }

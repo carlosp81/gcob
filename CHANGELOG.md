@@ -1,5 +1,18 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+- Certificate lookup defaults to the admin account's `~/.certs`: `CLN_CERT_DIR`
+  may be omitted for `gcob serve`, and `gcob-client` resolves `ca.pem`,
+  `client.pem` and `client-key.pem` there when no `--ca/--cert/--key` or
+  `CLN_CERT_DIR` is given (the CWD-relative `certs/` fallback is gone)
+
+### Fixed
+- Auth middleware returns a proper `Unauthenticated` gRPC status for rejected
+  runes (invalid or blacklisted) instead of resetting the HTTP/2 stream, which
+  the client surfaced as `h2 protocol error ... INTERNAL_ERROR`
+
 ## [0.5.1] - 2026-09-11
 
 Server-only `gcob init`, shared init flags and an ACL-safe certificate

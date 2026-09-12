@@ -1,7 +1,7 @@
 use std::fs;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 pub async fn connect(
@@ -68,8 +68,10 @@ fn resolve_path(
     if let Some(dir) = cert_dir {
         return Ok(dir.join(default_name));
     }
-    // Fallback to certs/ relative to current dir
-    Ok(std::path::PathBuf::from("certs").join(default_name))
+    // Default to the admin ~/.certs directory; never a CWD-relative path.
+    let default = gcob::certs::paths::ClientPaths::default_path()
+        .map_err(|e| anyhow!("Cannot resolve the default ~/.certs directory: {e}"))?;
+    Ok(default.cert_dir.join(default_name))
 }
 
 /// Target name used for TLS certificate verification.
@@ -97,5 +99,29 @@ mod tests {
     fn tls_domain_name_unwraps_ipv6() {
         assert_eq!(tls_domain_name("[::1]"), "::1");
         assert_eq!(tls_domain_name("[fe80::1]"), "fe80::1");
+    }
+
+    #[test]
+    fn explicit_cert_dir_wins_over_default() {
+        let dir = Some(std::path::PathBuf::from("/srv/gcob/certs"));
+        assert_eq!(
+            resolve_path(None, &dir, "ca.pem").unwrap(),
+            std::path::PathBuf::from("/srv/gcob/certs/ca.pem")
+        );
+        assert_eq!(
+            resolve_path(Some("/tmp/ca.pem"), &dir, "ca.pem").unwrap(),
+            std::path::PathBuf::from("/tmp/ca.pem")
+        );
+    }
+
+    #[test]
+    fn default_fallback_is_the_admin_certs_dir() {
+        match resolve_path(None, &None, "client.pem") {
+            Ok(path) => {
+                assert!(path.is_absolute(), "{path:?}");
+                assert!(path.ends_with(".certs/client.pem"), "{path:?}");
+            }
+            Err(e) => assert!(format!("{e}").contains("~/.certs"), "{e}"),
+        }
     }
 }
